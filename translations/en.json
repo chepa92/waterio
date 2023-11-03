@@ -1,0 +1,34 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "data": {
+                    "mac": "Bluetooth MAC address",
+                    "name": "Name"
+                },
+                "title": "Pick a Water.io bottle."
+            },
+            "validate": {
+                "data": {
+                    "retry": "Retry validate connection?",
+                },
+                "title": "Validate Water.io connection"
+            },
+            "manual": {
+                "data": {
+                    "mac": "Bluetooth MAC address",
+                    "name": "Name"
+                },
+                "title": "Enter bluetooth MAC address"
+            }
+        },
+        "error": {
+            "connect": "Unable to connect to WaterIo"
+        },
+        "abort": {
+            "cannot_validate": "Unable to validate Water.io bottle",
+            "cannot_connect": "Unable to connect to WaterIo"
+        }
+    },
+    "title": "Water.io"
+}
