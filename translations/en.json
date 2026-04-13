@@ -1,0 +1,71 @@
+{
+    "config": {
+        "step": {
+            "user": {
+                "data": {
+                    "mac": "Bluetooth MAC address",
+                    "name": "Name"
+                },
+                "title": "Pick a Water.io bottle."
+            },
+            "validate": {
+                "data": {
+                    "retry": "Retry validate connection?"
+                },
+                "title": "Validate Water.io connection"
+            },
+            "manual": {
+                "data": {
+                    "mac": "Bluetooth MAC address",
+                    "name": "Name"
+                },
+                "title": "Enter Bluetooth MAC address"
+            }
+        },
+        "error": {
+            "connect": "Unable to connect to Water.io bottle"
+        },
+        "abort": {
+            "cannot_validate": "Unable to validate Water.io bottle",
+            "cannot_connect": "Unable to connect to Water.io bottle"
+        }
+    },
+    "entity": {
+        "sensor": {
+            "battery": {
+                "name": "Battery"
+            },
+            "water_ml": {
+                "name": "Water Intake Today"
+            },
+            "temperature": {
+                "name": "Liquid Temperature"
+            },
+            "firmware": {
+                "name": "Firmware Version"
+            },
+            "hardware": {
+                "name": "Hardware Version"
+            }
+        }
+    },
+    "title": "Water.io",
+    "options": {
+        "step": {
+            "init": {
+                "title": "Water.io Options",
+                "data": {
+                    "poll_interval": "Poll interval (seconds)",
+                    "garmin_email": "Garmin Connect e-mail (optional)",
+                    "garmin_password": "Garmin Connect password (optional)",
+                    "garmin_auto_sync": "Auto-sync hydration to Garmin on every refresh"
+                },
+                "data_description": {
+                    "garmin_email": "Leave blank to disable Garmin sync",
+                    "garmin_password": "Password is stored in your HA secrets store",
+                    "garmin_auto_sync": "Automatically push water intake to Garmin Connect after every BLE poll"
+                }
+            }
+        }
+    }
+}

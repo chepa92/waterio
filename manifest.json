@@ -1,0 +1,15 @@
+{
+    "domain": "waterio",
+    "name": "Water.io Smart Bottle",
+    "documentation": "https://github.com/chepa92/waterio",
+    "issue_tracker": "https://github.com/chepa92/waterio/issues",
+    "config_flow": true,
+    "dependencies": [],
+    "codeowners": ["@chepa92"],
+    "requirements": ["bleak>=0.21.0", "bleak-retry-connector>=3.0.0"],
+    "bluetooth": [
+        {"local_name": "Water-IO-Cap*", "connectable": true}
+    ],
+    "iot_class": "local_polling",
+    "version": "3.0.0"
+}

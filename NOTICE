@@ -1,0 +1,53 @@
+NOTICE - Reverse Engineering Disclosure
+========================================
+
+This Home Assistant integration for Water.io smart bottles was developed through
+reverse engineering of the Water.io Android application for interoperability
+purposes only.
+
+Legal Basis
+-----------
+Reverse engineering for interoperability is generally legal under:
+- EU Software Directive (91/250/EEC) Article 6
+- US Copyright Law fair use doctrine (17 U.S.C. § 107)
+- Interoperability exemptions in most jurisdictions
+
+Methodology
+-----------
+1. Decompiled Water.io Android APK (versions 3.5.0 and 4.8.6) using JADX
+2. Analyzed decompiled Java/Kotlin source to understand BLE protocol
+3. Documented protocol opcodes, packet structures, and command sequences
+4. Implemented independent Python code from scratch (clean-room implementation)
+5. No Water.io source code was copied or incorporated
+
+What Was Reverse Engineered
+----------------------------
+- BLE GATT service/characteristic UUIDs
+- Command/response opcodes (e.g., 0x3C = GET_CAP_STATE)
+- Packet structure: [opcode, 0x00, 0x00, payload_len, ...payload]
+- TypeConfig TLV protocol for settings (type-length-value encoding)
+- Log entry format and interpretation
+
+What Was NOT Copied
+--------------------
+- No Water.io source code
+- No proprietary algorithms (firmware does all ADC→mL conversion)
+- No trade secrets beyond protocol observation
+- No circumvention of encryption or DRM (protocol is unencrypted)
+
+Attribution
+-----------
+Water.io is a trademark of Water.io Ltd.
+This project is independent and not affiliated with Water.io Ltd.
+
+The protocol implementation is original work by the contributors to this project.
+
+Disclaimer
+----------
+This software is provided for interoperability and home automation purposes only.
+Users are responsible for ensuring their use complies with applicable laws and
+any terms of service they have agreed to with Water.io Ltd.
+
+If Water.io Ltd. wishes to provide an official API or integration, please contact
+the project maintainers - this integration will be deprecated in favor of official
+support.
