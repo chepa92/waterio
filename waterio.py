@@ -71,10 +71,6 @@ from .const import (
 async def discover() -> list[BLEDevice]:
     """Discover Water.io BLE devices nearby."""
     devices = await BleakScanner.discover(timeout=10.0)
-    LOGGER.debug(
-        "BLE scan found: %s",
-        [{"address": d.address, "name": d.name} for d in devices],
-    )
     return [
         d for d in devices
         if d.name and d.name.startswith(DEVICE_NAME_PREFIX)
@@ -568,7 +564,6 @@ def _parse_notification(data: bytearray) -> dict[str, Any]:
 
     result: dict[str, Any] = {}
     opcode = data[0]
-    LOGGER.warning("BLE notify  opcode=0x%02x  len=%d  raw=%s", opcode, len(data), data.hex())
 
     try:
         if opcode == RESP_STATUS_PUSH:
@@ -579,7 +574,7 @@ def _parse_notification(data: bytearray) -> dict[str, Any]:
             #   byte[6] = reserved / 0x00
             # Battery and temperature are NOT in this push for protocolVersion=12.
             # Battery comes from RESP_GET_BATTERY (0x1B) and RESP_GET_CAP_STATE (0x3C).
-            LOGGER.debug("Status push 0x58: raw=%s", data.hex())
+            pass
 
         elif opcode == RESP_GET_CAP_STATE:
             # 0x3C: full cap state snapshot (CapStateResponse.java)
@@ -624,7 +619,6 @@ def _parse_notification(data: bytearray) -> dict[str, Any]:
                 if pv == 12 and len(data) >= 16:
                     daily_hydration = struct.unpack_from("<H", data, 14)[0]
                     if 0 < daily_hydration < 0xFFFF:
-                        LOGGER.debug("CapState pv12 dailyHydration=%dmL", daily_hydration)
                         if daily_hydration > (self._data.get(FIELD_CAP_ML, 0) or 0):
                             result[FIELD_CAP_ML] = daily_hydration
                 # pv >= 15: byte[17..18] is actual today's consumed ml from device
@@ -676,7 +670,6 @@ def _parse_notification(data: bytearray) -> dict[str, Any]:
                 # Goal is managed entirely in HA, not overwritten from device.
                 goal_idx = data[4]
                 goal_ml = _goal_index_to_ml(goal_idx)
-                LOGGER.debug("SyncInfo device goal_idx=%d → %smL (ignored, HA-managed)", goal_idx, goal_ml)
             if len(data) >= 12:
                 manual_ml = struct.unpack_from("<H", data, 8)[0]
                 cap_ml    = struct.unpack_from("<H", data, 10)[0]
@@ -697,27 +690,23 @@ def _parse_notification(data: bytearray) -> dict[str, Any]:
             # (UUID 0x2A19) which matches the value the app displays.
             if len(data) >= 5:
                 result[FIELD_BATTERY_CELL] = data[4] & 0xFF
-                LOGGER.debug("Battery cell: %d%%", result[FIELD_BATTERY_CELL])
 
         elif opcode == RESP_GET_EXTRA_GOAL:
             # 0x74: [4..5] = extraDailyGoalMl LE uint16
             if len(data) >= 6:
                 extra = struct.unpack_from("<H", data, 4)[0]
                 result[FIELD_EXTRA_GOAL_ML] = extra if extra < 0xFFFF else 0
-                LOGGER.debug("Extra daily goal: %dmL", result[FIELD_EXTRA_GOAL_ML])
 
         elif opcode == RESP_GET_SILENT_MODE:
             # 0x67: [4] = 0=off, 1=on
             if len(data) >= 5:
                 result[FIELD_SILENT_MODE] = bool(data[4])
-                LOGGER.debug("Silent mode: %s", result[FIELD_SILENT_MODE])
 
         elif opcode == RESP_GET_MAC:
             # 0x49: [4..9] = 6-byte BT MAC in order (AA:BB:CC:DD:EE:FF)
             if len(data) >= 10:
                 mac_bytes = data[4:10]
                 result[FIELD_MAC_ADDRESS] = ":".join(f"{b:02X}" for b in mac_bytes)
-                LOGGER.debug("MAC address: %s", result[FIELD_MAC_ADDRESS])
 
         elif opcode == RESP_GET_VERSION:
             # 0x1D: [3]=plen, [4..4+plen] = ASCII version string
@@ -725,7 +714,6 @@ def _parse_notification(data: bytearray) -> dict[str, Any]:
                 plen = data[3] & 0xFF
                 raw_str = bytes(data[4:4 + plen]).rstrip(b"\x00")
                 result[FIELD_FIRMWARE] = raw_str.decode("ascii", "replace")
-                LOGGER.debug("Firmware version: %s", result[FIELD_FIRMWARE])
 
         elif opcode == RESP_GET_REAL_TIME:
             # 0x10: [4..7] = LE uint32 timestamp
@@ -738,21 +726,18 @@ def _parse_notification(data: bytearray) -> dict[str, Any]:
                         result[FIELD_DEVICE_CLOCK] = dt.isoformat(timespec="seconds")
                     except Exception:
                         result[FIELD_DEVICE_CLOCK] = str(ts)
-                LOGGER.debug("Device RTC: %d", ts)
 
         elif opcode == RESP_GET_LOG_LENGTH:
             # 0x0D: [4..5] = LE uint16 log count
             if len(data) >= 6:
                 count = struct.unpack_from("<H", data, 4)[0]
                 result[FIELD_LOG_COUNT] = count
-                LOGGER.debug("Log entries: %d", count)
 
         elif opcode == RESP_ACK:
-            # 0x5A: generic success ACK from SET_* commands
-            LOGGER.debug("ACK 0x5A received")
+            pass  # generic success ACK from SET_* commands
 
         else:
-            LOGGER.debug("Unhandled opcode 0x%02x: %s", opcode, data.hex())
+            pass  # unhandled opcode
 
     except Exception as exc:
         LOGGER.warning(
@@ -1046,11 +1031,10 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             try:
                 raw = await self._client.read_gatt_char(uuid)
                 self._data[field] = parser(bytearray(raw))
-                LOGGER.debug("GATT read %s = %s", field, self._data[field])
             except (BleakError, KeyError):
                 pass  # not all firmware versions expose every characteristic
-            except Exception as exc:
-                LOGGER.debug("GATT read error %s: %s", uuid, exc)
+            except Exception:
+                pass  # GATT read error
 
     async def _write_cmd(self, opcode: int, payload: bytes = b"") -> bool:
         """Write a command byte to the write characteristic (v4.8.6 packet format)."""
@@ -1173,7 +1157,6 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         pkt = _make_cmd(opcode, payload, size=4 + len(payload))
         try:
             await self._client.write_gatt_char(self._write_char, pkt, response=False)
-            LOGGER.warning("CMD 0x%02x -> %s", opcode, pkt.hex())
             return True
         except BleakError as exc:
             LOGGER.warning("Write failed 0x%02x: %s", opcode, exc)
@@ -1415,13 +1398,6 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         LOGGER.info(
                             "HydrationV2 (fallback): drink=%dmL  ts=%s", drink_ml, ts_iso,
                         )
-            else:
-                hv2 = [e for e in all_entries if e["type"] == chr(0xDC)]
-                if hv2:
-                    LOGGER.debug(
-                        "Skipping %d Ü events (drinks already counted from l entries)",
-                        len(hv2),
-                    )
         finally:
             self._log_queue = None
 
@@ -1451,7 +1427,6 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # open between polls.  Saves bottle battery and avoids Android app
                 # being locked out of its own device.
                 await self.disconnect()
-                LOGGER.debug("BLE disconnected after poll (%s)", self._mac)
 
     def _compute_daily_water(self) -> None:
         """Single source of truth for ALL daily hydration entities.
@@ -1612,8 +1587,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             new_options["_prev_cap_ml"]         = self._prev_cap_ml
             new_options["_baseline_date"]       = self._daily_today_date.isoformat() if self._daily_today_date else ""
             self.hass.config_entries.async_update_entry(self.config_entry, options=new_options)
-        except Exception as exc:
-            LOGGER.debug("Could not persist daily baseline: %s", exc)
+        except Exception:
+            pass  # Could not persist daily baseline
 
     async def disconnect(self) -> None:
         """Cleanly disconnect from the BLE device."""

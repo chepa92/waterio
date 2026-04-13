@@ -8,9 +8,8 @@ DOMAIN = "waterio"
 # -------------------------------------------------------------------
 DEVICE_NAME_PREFIX = "Water-IO-Cap"
 
-# Poll interval (seconds) – 60 s so HA captures drink log events before
-# the Water.io app connects and calls ClearDataCommand.
-UPDATE_INTERVAL = 60
+# Poll interval (seconds) – sync once per hour.
+UPDATE_INTERVAL = 3600
 
 # -------------------------------------------------------------------
 # Standard GATT UUIDs (Bluetooth SIG)
