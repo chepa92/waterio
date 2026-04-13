@@ -45,7 +45,4 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         coordinator: WaterioCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
         await coordinator.disconnect()
-        # Remove service if no more entries loaded
-        if not hass.data.get(DOMAIN):
-            hass.services.async_remove(DOMAIN, SERVICE_SYNC_GARMIN)
     return unload_ok

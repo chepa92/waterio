@@ -6,7 +6,7 @@
     "config_flow": true,
     "dependencies": [],
     "codeowners": ["@chepa92"],
-    "requirements": ["bleak>=0.21.0", "bleak-retry-connector>=3.0.0"],
+    "requirements": ["bleak>=0.22.0", "bleak-retry-connector>=3.4.0"],
     "bluetooth": [
         {"local_name": "Water-IO-Cap*", "connectable": true}
     ],

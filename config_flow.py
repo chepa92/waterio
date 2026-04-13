@@ -1,6 +1,6 @@
 import asyncio
 from datetime import timedelta
-from .waterio import discover, WaterioInstance
+from .waterio import discover
 from typing import Any
 
 from homeassistant import config_entries
@@ -20,7 +20,6 @@ MANUAL_MAC = "manual"
 
 class WaterIoFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_LOCAL_POLL
 
     @staticmethod
     def async_get_options_flow(config_entry):
