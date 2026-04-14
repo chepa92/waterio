@@ -95,6 +95,83 @@ _build_cmd = _make_cmd
 
 
 # ===========================================================================
+# ARCHITECTURE & DESIGN NOTES
+# ===========================================================================
+#
+# ── ENTITY AVAILABILITY STRATEGY ───────────────────────────────────────────
+#
+#   When the bottle cap is out of BLE range (user away from home), the
+#   coordinator poll fails.  HA's default CoordinatorEntity marks ALL entities
+#   "unavailable" immediately, which hides last_sync, water_remaining, etc.
+#
+#   Our strategy:
+#     • _async_update_data returns LAST KNOWN DATA on BLE failure (instead of
+#       raising UpdateFailed).  This keeps coordinator.last_update_success True
+#       and all entities showing stale values.
+#     • A `ble_reachable` flag in the coordinator data dict indicates whether
+#       the device was actually reached on the last poll.
+#     • Read-only entities (sensor, binary_sensor) override `available` to
+#       return True as long as last_sync is < 24 hours ago.  After 24 hours
+#       without a successful sync, they go "unavailable".
+#     • Write-capable entities (switch, number, select, light, button minus
+#       sync) check `ble_reachable` — they go unavailable immediately when
+#       the device is unreachable, since writing settings requires BLE.
+#     • The "Force Sync" button is ALWAYS available (can trigger reconnect).
+#
+# ── MULTI-DAY RETRO-SYNC ──────────────────────────────────────────────────
+#
+#   The device accumulates log entries in flash.  CLEAR_LOGS is sent after
+#   each successful sync, so normally only new entries appear.  But if the
+#   bottle has not been synced for days (user travel, HA offline, etc.),
+#   entries spanning multiple calendar days accumulate.
+#
+#   _read_logs_async processes ALL entries chronologically.  prev_level and
+#   water_remaining are tracked across day boundaries.  However, only
+#   TODAY's drinks increment _daily_accumulated_drinks.  Past-day drinks are
+#   logged for diagnostics but not added to today's count.
+#
+#   This ensures water_remaining always reflects the physical bottle state
+#   regardless of sync gap, while the "drinks today" counter stays accurate.
+#
+# ── PERSISTENCE & VERSION MIGRATION ───────────────────────────────────────
+#
+#   Daily hydration state is persisted into config_entry.options so it
+#   survives HA restarts within the same calendar day.  Keys:
+#     _baseline_cap_ml, _baseline_manual, _accumulated_ml,
+#     _accumulated_drinks, _last_drink_ml, _last_drink_ts,
+#     _water_remaining, _prev_cap_ml, _baseline_date, _persist_version
+#
+#   _persist_version is bumped when drink-counting logic changes materially.
+#   On startup, if the saved version < current version, stale drink
+#   accumulators are reset to 0 (water_remaining is preserved since it
+#   reflects physical state).  This prevents carryover of inflated counts
+#   from older buggy code.
+#
+# ── DRINK COUNTING — THREE DATA SOURCES (ONE ACTIVE) ──────────────────────
+#
+#   1. 'l' (VOLUME_AS_ML) log entry deltas    ← PRIMARY, used when available
+#      prev_level − current_level ≥ 30 mL = 1 drink.
+#
+#   2. 'Ü' (HYDRATION_V2) log entries         ← FALLBACK only
+#      extra×5 = drink mL.  Used ONLY when no 'l' entries in the batch.
+#
+#   3. cap_ml (GET_HYDRATIONS 0x72) delta      ← FALLBACK only
+#      Used ONLY when _water_level_from_log is False (no log entries at all).
+#      Fires in _compute_daily_water() for housekeeping-only syncs.
+#
+#   _water_level_from_log flag prevents double-counting: set True after
+#   processing 'l' entries, reset to False after _compute_daily_water.
+#
+# ── RAW ADC GUARD ─────────────────────────────────────────────────────────
+#
+#   On pv=12 firmware, 'L'/'U' entries carry raw ultrasonic ADC (10k–30k
+#   range), not mL.  Only 'l' and 'Ð' carry firmware-converted mL.
+#   Guard: any level > 2× bottle_capacity is skipped as raw ADC.
+#   Applied in both _read_logs_async and the real-time 0x0E handler.
+#
+# ===========================================================================
+
+# ===========================================================================
 # WATER.IO BLE PROTOCOL REFERENCE
 # Reverse-engineered from SDK source (JADX decompile of io.water.hydration
 # v4.8.6 APK).  Source files: ReadLogsCommand.java, EnumCommandDevice.java,
@@ -619,8 +696,9 @@ def _parse_notification(data: bytearray) -> dict[str, Any]:
                 if pv == 12 and len(data) >= 16:
                     daily_hydration = struct.unpack_from("<H", data, 14)[0]
                     if 0 < daily_hydration < 0xFFFF:
-                        if daily_hydration > (self._data.get(FIELD_CAP_ML, 0) or 0):
-                            result[FIELD_CAP_ML] = daily_hydration
+                        # Always store; coordinator picks the larger of
+                        # GET_HYDRATIONS vs CapState on each poll.
+                        result[FIELD_CAP_ML] = daily_hydration
                 # pv >= 15: byte[17..18] is actual today's consumed ml from device
                 if pv >= 15 and len(data) >= 19:
                     measured = struct.unpack_from("<H", data, 17)[0]
@@ -812,14 +890,43 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # entries (READ_LOGS 0x0E).  Refill detection matches original app:
         # water level going up = refill, going down = drink.
         opts = entry.options or {}
-        self._daily_baseline_cap_ml: int    = int(opts.get("_baseline_cap_ml", 0))
-        self._daily_baseline_manual: int    = int(opts.get("_baseline_manual", 0))
-        self._daily_accumulated_ml: int     = int(opts.get("_accumulated_ml", 0))
-        self._daily_accumulated_drinks: int = int(opts.get("_accumulated_drinks", 0))
-        self._daily_last_drink_ml: int      = int(opts.get("_last_drink_ml", 0))
-        self._daily_last_drink_ts: str      = str(opts.get("_last_drink_ts", ""))
-        self._daily_water_remaining: int    = int(opts.get("_water_remaining", 0))
-        self._prev_cap_ml: int              = int(opts.get("_prev_cap_ml", self._daily_baseline_cap_ml))
+
+        # Persistence schema version: bump this when drink-counting logic
+        # changes materially so stale accumulators from buggy older code
+        # are discarded automatically on the first restart after upgrade.
+        _PERSIST_VERSION = 2
+        saved_version = int(opts.get("_persist_version", 0))
+
+        if saved_version < _PERSIST_VERSION:
+            LOGGER.info(
+                "Persistence version %d → %d: resetting stale daily drink "
+                "accumulators (old values: drinks=%s, water_ml=%s, remaining=%s)",
+                saved_version, _PERSIST_VERSION,
+                opts.get("_accumulated_drinks", 0),
+                opts.get("_accumulated_ml", 0),
+                opts.get("_water_remaining", 0),
+            )
+            # Keep _water_remaining and _baseline_cap_ml — they reflect
+            # physical bottle state.  Only reset drink COUNTS that were
+            # inflated by old buggy code.
+            self._daily_baseline_cap_ml     = int(opts.get("_baseline_cap_ml", 0))
+            self._daily_baseline_manual     = int(opts.get("_baseline_manual", 0))
+            self._daily_accumulated_ml      = 0
+            self._daily_accumulated_drinks  = 0
+            self._daily_last_drink_ml       = 0
+            self._daily_last_drink_ts       = ""
+            self._daily_water_remaining     = int(opts.get("_water_remaining", 0))
+            self._prev_cap_ml               = int(opts.get("_prev_cap_ml", self._daily_baseline_cap_ml))
+        else:
+            self._daily_baseline_cap_ml     = int(opts.get("_baseline_cap_ml", 0))
+            self._daily_baseline_manual     = int(opts.get("_baseline_manual", 0))
+            self._daily_accumulated_ml      = int(opts.get("_accumulated_ml", 0))
+            self._daily_accumulated_drinks  = int(opts.get("_accumulated_drinks", 0))
+            self._daily_last_drink_ml       = int(opts.get("_last_drink_ml", 0))
+            self._daily_last_drink_ts       = str(opts.get("_last_drink_ts", ""))
+            self._daily_water_remaining     = int(opts.get("_water_remaining", 0))
+            self._prev_cap_ml               = int(opts.get("_prev_cap_ml", self._daily_baseline_cap_ml))
+
         saved_date_str: str | None          = opts.get("_baseline_date")
         try:
             from datetime import date as _date
@@ -831,18 +938,17 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._daily_water_remaining <= 0 and self._daily_today_date is not None:
             _bv = int(self._settings.get(FIELD_BOTTLE_VOLUME, 0))
             self._daily_water_remaining = _BOTTLE_VOLUME_ML.get(_bv, 500)
-        saved_date_str: str | None          = opts.get("_baseline_date")
-        try:
-            from datetime import date as _date
-            self._daily_today_date = _date.fromisoformat(saved_date_str) if saved_date_str else None
-        except (ValueError, TypeError):
-            self._daily_today_date = None
         # Queue for READ_LOGS (0x0E) streaming responses
         self._log_queue: asyncio.Queue | None = None
         # Set to True when _read_logs_async successfully extracted a water level
         # from a real log entry – prevents _compute_daily_water from overwriting
         # it with the modular-arithmetic estimate.
         self._water_level_from_log: bool = False
+        # Snapshot of _daily_accumulated_drinks taken just before
+        # _fetch_protocol_data so the new-day reset in _compute_daily_water can
+        # isolate drinks that _read_logs_async added for TODAY vs stale
+        # persisted count from yesterday.
+        self._pre_fetch_drinks: int = 0
         # Mutex to serialise all BLE connect/disconnect sessions.
         self._ble_lock: asyncio.Lock = asyncio.Lock()
 
@@ -879,13 +985,23 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Autonomous 0x0E push: data[4..7]=ts, data[8]=opCode, data[9..10]=level
             if len(raw) >= 12:
                 ev = chr(raw[8]) if 32 <= raw[8] < 127 else ""
-                if ev in ("L", "U", "l", "N"):
+                if ev in ("L", "U", "l"):
                     level = struct.unpack_from("<H", raw, 9)[0]
-                    if 0 < level < 0xFFFF:
+                    # On pv=12, L/U carry raw ultrasonic ADC (10k-30k), not mL.
+                    # Only trust values within 2× bottle capacity.
+                    _bottle = _BOTTLE_VOLUME_ML.get(
+                        self._data.get("bottle_volume_type", 0), 500
+                    )
+                    if 0 < level <= _bottle * 2:
                         self._daily_water_remaining = level
                         self._data[FIELD_WATER_REMAINING_ML] = level
                         LOGGER.info("Real-time measurement: type=%s  remaining=%dmL", ev, level)
                         self.async_set_updated_data(dict(self._data))
+                    elif level > _bottle * 2:
+                        LOGGER.info(
+                            "Skipping real-time push type=%s level=%d (> %d, likely raw ADC)",
+                            ev, level, _bottle * 2,
+                        )
             return
         parsed = _parse_notification(raw)
         if parsed:
@@ -1272,10 +1388,23 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             #   if new_level > prev_level → REFILL (water went up)
             #   if prev_level - new_level >= 30 → DRINK
             #   if 0xD0 event → explicit firmware refill with DAR/DBR sub-type
+            #
+            # MULTI-DAY RETRO-SYNC:
+            #   When the bottle hasn't been synced for several days (user away,
+            #   HA offline, etc.) the device accumulates log entries spanning
+            #   multiple calendar days.  We process ALL entries in chronological
+            #   order, tracking prev_level and water_remaining across the full
+            #   history.  Only entries from TODAY accumulate into the daily
+            #   drink counters; older entries are logged for diagnostics but
+            #   their drinks are not added to today's count.
 
             _REFILL_OPCODE = chr(0xD0)  # "Ð" firmware refill event
-            # All opCodes that carry water level in mL
+            # Opcodes that carry water level in mL (all update water_remaining).
             _LEVEL_OPCODES = {"L", "U", "l", _REFILL_OPCODE}
+            # Only 'l' (VOLUME_AS_ML) triggers drink counting, matching the
+            # original SDK: ReadLogsCommand only calls HydrationRepo.m3823q()
+            # for case 'l' — NOT for 'L' / 'U'.
+            _DRINK_OPCODES = {"l"}
 
             bottle_cap = _BOTTLE_VOLUME_ML.get(
                 self._data.get("bottle_volume_type", 0), 500
@@ -1292,6 +1421,20 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if processable:
                 processable.sort(key=lambda e: e["ts"])
+
+                # Detect multi-day span for logging
+                from datetime import date as _date_cls
+                first_ts = processable[0]["ts"]
+                last_ts  = processable[-1]["ts"]
+                first_day = _date_cls.fromtimestamp(first_ts)
+                last_day  = _date_cls.fromtimestamp(last_ts)
+                if first_day != last_day:
+                    LOGGER.info(
+                        "Multi-day retro-sync: entries span %s → %s (%d days)",
+                        first_day.isoformat(), last_day.isoformat(),
+                        (last_day - first_day).days + 1,
+                    )
+
                 today_start = int(dt_util.now().replace(
                     hour=0, minute=0, second=0, microsecond=0
                 ).timestamp())
@@ -1311,6 +1454,10 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # firmware-converted mL.  Skip raw-ADC entries so they don't
                 # pollute prev_level and produce bogus drink deltas.
                 _MAX_SANE_ML = bottle_cap * 2
+
+                # Counters for past-day diagnostics
+                past_drinks_total = 0
+                past_ml_total = 0
 
                 for entry in processable:
                     ev    = entry["type"]
@@ -1339,10 +1486,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         prev_level = level
 
                     else:
-                        # L/U/l — all carry mL from firmware
+                        # L/U/l — all carry mL from firmware; update water level.
+                        # Only 'l' entries count as drinks (matches original SDK).
                         if prev_level is not None:
                             delta = prev_level - level
-                            if delta >= 30:
+                            if delta >= 30 and ev in _DRINK_OPCODES:
                                 # Drink detected (≥30 mL threshold — HydrationRepo.m3820m)
                                 if is_today:
                                     self._daily_accumulated_drinks += 1
@@ -1351,6 +1499,9 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                         self._daily_last_drink_ts = ts_iso
                                     except Exception:
                                         pass
+                                else:
+                                    past_drinks_total += 1
+                                    past_ml_total += delta
                                 LOGGER.info(
                                     "Drink: %dmL → %dmL  consumed=%dmL  type=%s  today=%s  ts=%s",
                                     prev_level, level, delta, ev, is_today, ts_iso,
@@ -1366,6 +1517,12 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
                     last_level = level
 
+                if past_drinks_total:
+                    LOGGER.info(
+                        "Retro-sync: %d past-day drinks totalling %dmL (not added to today)",
+                        past_drinks_total, past_ml_total,
+                    )
+
                 if last_level is not None and 0 < last_level <= bottle_cap * 4:
                     self._daily_water_remaining = last_level
                     self._data[FIELD_WATER_REMAINING_ML] = last_level
@@ -1375,29 +1532,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         last_level,
                     )
 
-            # ── 0xDC (Ü) HydrationV2 events (FALLBACK only) ───────────────────
-            # On pv=12 firmware, both 'l' entries AND 'Ü' entries appear for
-            # the same sip.  'l' deltas already count drinks above, so we only
-            # use 'Ü' when NO 'l' entries were processed (to avoid double-count).
-            # HydrationRepo.m3822p(ts, lo*5, hi*5, extra*5, "hydrationV2", mac)
-            if not self._water_level_from_log:
-                hv2 = [e for e in all_entries if e["type"] == chr(0xDC)]
-                for entry in hv2:
-                    drink_ml = entry["extra"] * 5
-                    if drink_ml >= 30:
-                        ts_iso = datetime.fromtimestamp(
-                            entry["ts"], tz=timezone.utc
-                        ).isoformat(timespec="seconds")
-                        today_start = int(dt_util.now().replace(
-                            hour=0, minute=0, second=0, microsecond=0
-                        ).timestamp())
-                        if entry["ts"] >= today_start:
-                            self._daily_accumulated_drinks += 1
-                            self._daily_last_drink_ml = drink_ml
-                            self._daily_last_drink_ts = ts_iso
-                        LOGGER.info(
-                            "HydrationV2 (fallback): drink=%dmL  ts=%s", drink_ml, ts_iso,
-                        )
+            # 0xDC (Ü) HydrationV2: NOT used — in the original SDK m3822p() is
+            # gated on a cloud-sync / premium flag (m3818k) and does NOT fire
+            # for regular users.  Since 'l' entries always appear on pv=12
+            # firmware, we rely on those exclusively and discard Ü to avoid
+            # double-counting.
         finally:
             self._log_queue = None
 
@@ -1406,13 +1545,32 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Connect → read everything → disconnect.  We never hold the connection
         open between polls — that would drain the bottle's battery.
+
+        When the device is unreachable (user away from home, BLE out of range)
+        we return the last known data instead of raising UpdateFailed so that
+        sensors stay "available" (showing stale values) until the 24-hour
+        staleness timeout kicks in.  This lets the user always see when the
+        last successful sync was.
         """
         async with self._ble_lock:
             if not await self._ensure_connected():
+                # Device not reachable — return last known data if we have any
+                if self._data.get(FIELD_LAST_SYNC):
+                    LOGGER.info(
+                        "BLE connect failed – returning last known data  "
+                        "last_sync=%s", self._data.get(FIELD_LAST_SYNC),
+                    )
+                    public = {k: v for k, v in self._data.items()
+                              if not k.startswith("_")}
+                    public["ble_reachable"] = False
+                    return public
                 raise UpdateFailed(f"Cannot connect to Water.io cap {self._mac}")
 
             try:
                 await self._read_standard_gatt()      # battery, firmware, manufacturer …
+                # Snapshot drink counter BEFORE log reading so new-day reset can
+                # distinguish persisted-yesterday count from today's log entries.
+                self._pre_fetch_drinks = self._daily_accumulated_drinks
                 await self._fetch_protocol_data()     # proprietary hydration + cap-state
                 self._compute_daily_water()           # cap-delta fallback (no-log path only)
 
@@ -1420,6 +1578,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Strip private accumulator fields (prefixed with '_') from the
                 # dict returned to the coordinator — they're internal state only.
                 public_data = {k: v for k, v in self._data.items() if not k.startswith("_")}
+                public_data["ble_reachable"] = True
                 LOGGER.info("Water.io update complete  device=%s  data=%s", self._name, public_data)
                 return public_data
             finally:
@@ -1469,27 +1628,32 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # ── New calendar day ────────────────────────────────────────────────
         if self._daily_today_date != today:
+            # _read_logs_async already ran this poll and may have added today's
+            # drinks into the accumulators on top of yesterday's persisted count.
+            # Isolate today's log contribution using the pre-fetch snapshot.
+            # _daily_accumulated_drinks may include yesterday's persisted count +
+            # today's drinks just added by _read_logs_async.  Subtract the
+            # snapshot to get only what log processing added for today.
+            today_drinks = max(0, self._daily_accumulated_drinks - self._pre_fetch_drinks)
             LOGGER.info(
-                "New day %s — resetting daily water tracking  cap_ml=%d",
-                today, cap_ml,
+                "New day %s — resetting daily water tracking  cap_ml=%d  "
+                "log contributed today: %d drinks",
+                today, cap_ml, today_drinks,
             )
             self._daily_today_date          = today
             self._daily_accumulated_ml      = 0
-            self._daily_accumulated_drinks  = 0
+            self._daily_accumulated_drinks  = today_drinks
             self._daily_baseline_cap_ml     = cap_ml
             self._daily_baseline_manual     = manual_ml
-            self._daily_last_drink_ml       = 0
-            self._daily_last_drink_ts       = ""
+            # Preserve last-drink info only if log produced a drink today
+            if not today_drinks:
+                self._daily_last_drink_ml   = 0
+                self._daily_last_drink_ts   = ""
             # Preserve water_remaining — bottle still has water from yesterday
             if self._daily_water_remaining <= 0:
                 self._daily_water_remaining = bottle_cap
             self._prev_cap_ml               = cap_ml
-            self._data[FIELD_WATER_ML]          = 0
-            self._data[FIELD_DRINK_COUNT_TODAY]  = 0
-            self._data[FIELD_LAST_DRINK_ML]      = 0
-            self._data[FIELD_LAST_DRINK_TS]      = None
-            self._persist_baseline()
-            return
+            # Fall through — compute totals correctly below instead of returning early
 
         # ── CLEAR_LOGS detection: cap_ml dropped vs previous poll ───────────
         if cap_ml < self._prev_cap_ml - 20:
@@ -1577,6 +1741,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         survives an HA restart within the same calendar day."""
         try:
             new_options = dict(self.config_entry.options)
+            new_options["_persist_version"]     = 2
             new_options["_baseline_cap_ml"]     = self._daily_baseline_cap_ml
             new_options["_baseline_manual"]     = self._daily_baseline_manual
             new_options["_accumulated_ml"]      = self._daily_accumulated_ml
