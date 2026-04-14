@@ -147,27 +147,31 @@ _build_cmd = _make_cmd
 #   reflects physical state).  This prevents carryover of inflated counts
 #   from older buggy code.
 #
-# ── DRINK COUNTING — THREE DATA SOURCES (ONE ACTIVE) ──────────────────────
+# ── DRINK COUNTING — TWO DATA SOURCES (ONE ACTIVE) ──────────────────────
 #
 #   1. 'l' (VOLUME_AS_ML) log entry deltas    ← PRIMARY, used when available
-#      prev_level − current_level ≥ 30 mL = 1 drink.
+#      prev_level − current_level ≥ 30 mL = 1 drink.  Matches original SDK:
+#      ReadLogsCommand case 'l' → HydrationRepo.m3823q().  'L'/'U' entries
+#      only update water_remaining (prev_level) but never trigger a drink.
 #
-#   2. 'Ü' (HYDRATION_V2) log entries         ← FALLBACK only
-#      extra×5 = drink mL.  Used ONLY when no 'l' entries in the batch.
-#
-#   3. cap_ml (GET_HYDRATIONS 0x72) delta      ← FALLBACK only
-#      Used ONLY when _water_level_from_log is False (no log entries at all).
+#   2. cap_ml (GET_HYDRATIONS 0x72) delta      ← FALLBACK only
+#      Used ONLY when _water_level_from_log is False (no 'l' log entries).
 #      Fires in _compute_daily_water() for housekeeping-only syncs.
 #
-#   _water_level_from_log flag prevents double-counting: set True after
-#   processing 'l' entries, reset to False after _compute_daily_water.
+#   'Ü' (0xDC HYDRATION_V2) is NOT used: the original SDK m3822p() is gated
+#   on a cloud-sync / premium flag (m3818k) that is never set in HA context.
+#   Using it would double-count every sip because 'l' entries already appear.
 #
-# ── RAW ADC GUARD ─────────────────────────────────────────────────────────
+#   _water_level_from_log flag prevents double-counting: set True after
+#   processing 'l'/'Ð' entries, reset to False after _compute_daily_water.
+#
+# ── L/U RAW ADC NOTE ──────────────────────────────────────────────────────
 #
 #   On pv=12 firmware, 'L'/'U' entries carry raw ultrasonic ADC (10k–30k
-#   range), not mL.  Only 'l' and 'Ð' carry firmware-converted mL.
-#   Guard: any level > 2× bottle_capacity is skipped as raw ADC.
-#   Applied in both _read_logs_async and the real-time 0x0E handler.
+#   range), not mL.  'l' and 'Ð' reliably carry firmware-converted mL.
+#   L/U are included in _LEVEL_OPCODES only to update prev_level/water_
+#   remaining if they happen to fall within 2× bottle_capacity (sane guard).
+#   They NEVER increment the drink counter (_DRINK_OPCODES = {'l'} only).
 #
 # ===========================================================================
 
@@ -317,13 +321,12 @@ _build_cmd = _make_cmd
 #   L/U carry RAW ultrasonic readings (10000–30000 range) while ONLY 'l' and
 #   'Ð' (0xD0) carry firmware-converted mL.  Our code uses _MAX_SANE_ML guard
 #   (2× bottle_capacity) to skip raw-ADC L/U entries automatically.
-#   Drink detection: level DOWN ≥ 30 mL = drink.  Level UP = refill.
+#   Drink detection: level DOWN ≥ 30 mL counts as a drink for 'l' ONLY.
+#   L/U entries update prev_level for water_remaining but never count a drink.
 #
-#   NOTE ON 'Ü' (0xDC) vs 'l':  On pv=12 firmware, each cap open/close cycle
-#   produces BOTH a 'l' entry (absolute water level in mL) AND a 'Ü' entry
-#   (drink amount = extra×5 mL).  These are REDUNDANT — processing both would
-#   double-count drinks.  We use 'l' as primary (via prev_level delta) and
-#   only fall back to 'Ü' if no 'l' entries were in the batch.
+#   NOTE ON 'Ü' (0xDC):  Deliberately ignored (see DRINK COUNTING section
+#   above).  On pv=12 both 'l' and 'Ü' appear for the same sip; the correct
+#   fix is to use only 'l' (as the SDK does), not to choose one conditionally.
 #
 # ── 3. REFILL DETECTION — HOW IT WORKS ────────────────────────────────────
 #
@@ -1300,11 +1303,13 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
           There is NO calibration table or polynomial in the app code.
           m4147y() → m20709h() = plain unsigned 16-bit little-endian read.
 
-        Hydration processing (HydrationRepo.m3823q):
-          - L/U/l/0xD0: mMeasurement = current water level in mL
-          - level went DOWN ≥ 30 mL from prev → DRINK
-          - level went UP from prev → REFILL (silent update in app)
-          - 0xD0 with extraData 1/2/3 → explicit DAR/DBR/BOTH refill
+        Hydration processing (matching original SDK HydrationRepo.m3823q):
+          - 'l' (0x6C): level DOWN ≥ 30 mL from prev → DRINK  ← only source
+          - 'L'/'U'    : update prev_level/water_remaining only, NO drink count
+          - 'Ð' (0xD0) : explicit firmware refill → update prev_level, no drink
+          - level UP from prev → REFILL (silent update, no drink entry in SDK)
+          - 0xD0 with extraData 1/2/3 → explicit DAR/DBR/BOTH refill sub-type
+          - 'Ü' (0xDC) : IGNORED (SDK m3822p gated on premium flag, see notes)
         """
         if not self._write_char:
             return
@@ -1373,20 +1378,22 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # ── Process log entries ─────────────────────────────────────────
             #
-            # Hydration-relevant opCodes (ReadLogsCommand switch → HydrationRepo):
+            # opCodes that carry a water level and how we use them:
             #
-            #   'L' (0x4C) MEASUREMENT_ACCURATE  — mMeasurement = mL (firmware-converted)
-            #   'U' (0x55) MEASUREMENT_ESTIMATED — mMeasurement = mL (firmware-converted)
-            #   'l' (0x6C) VOLUME_AS_ML          — mMeasurement = mL
-            #   'Ð' (0xD0) FIRMWARE_REFILL       — mMeasurement = post-refill mL
-            #   'Ü' (0xDC) HYDRATION_V2          — bytes each ×5 for mL
+            #   'L' (0x4C) MEASUREMENT_ACCURATE  — update prev_level only (no drink)
+            #   'U' (0x55) MEASUREMENT_ESTIMATED — update prev_level only (no drink)
+            #   'l' (0x6C) VOLUME_AS_ML          — drink if down ≥30 mL  ← ONLY source
+            #   'Ð' (0xD0) FIRMWARE_REFILL       — explicit refill, reset prev_level
             #
-            # ALL of these carry mL values directly from the firmware.
-            # The app (m4147y → m20709h) just reads uint16 LE — no conversion.
+            # 'Ü' (0xDC) HYDRATION_V2: deliberately ignored (see architecture notes).
+            #
+            # SDK source: ReadLogsCommand.java m4145w() switch statement.
+            # Only case 'l' calls HydrationRepo.m3823q() for a drink.
+            # Cases 'L'/'U' call setMeasurement() only — no HydrationRepo call.
             #
             # Refill detection (HydrationRepo.m3823q):
-            #   if new_level > prev_level → REFILL (water went up)
-            #   if prev_level - new_level >= 30 → DRINK
+            #   if new_level > prev_level → REFILL (water went up, silent)
+            #   if prev_level - new_level >= 30 AND opCode == 'l' → DRINK
             #   if 0xD0 event → explicit firmware refill with DAR/DBR sub-type
             #
             # MULTI-DAY RETRO-SYNC:
