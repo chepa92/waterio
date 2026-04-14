@@ -217,6 +217,14 @@ class WaterioNumber(CoordinatorEntity[WaterioCoordinator], NumberEntity):
         )
 
     @property
+    def available(self) -> bool:
+        """Unavailable when BLE device is not reachable (can't write settings)."""
+        data = self.coordinator.data
+        if not data:
+            return False
+        return bool(data.get("ble_reachable", False))
+
+    @property
     def native_value(self) -> float | None:
         if self.coordinator.data is None:
             return None

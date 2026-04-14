@@ -83,10 +83,13 @@ class WaterioButton(CoordinatorEntity[WaterioCoordinator], ButtonEntity):
 
     @property
     def available(self) -> bool:
-        """Force Sync must stay pressable even when the device is unavailable."""
+        """Sync stays pressable always; other buttons need BLE reachable."""
         if self.entity_description.action == "sync":
             return True
-        return super().available
+        data = self.coordinator.data
+        if not data:
+            return False
+        return bool(data.get("ble_reachable", False))
 
     async def async_press(self) -> None:
         """Handle button press."""

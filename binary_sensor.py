@@ -22,6 +22,8 @@ from .const import (
 )
 from .waterio import WaterioCoordinator
 
+from datetime import datetime, timezone, timedelta
+
 
 @dataclass(frozen=True, kw_only=True)
 class WaterioBinarySensorDescription(BinarySensorEntityDescription):
@@ -106,6 +108,23 @@ class WaterioBinarySensor(CoordinatorEntity[WaterioCoordinator], BinarySensorEnt
             sw_version=data.get(FIELD_FIRMWARE),
             serial_number=data.get(FIELD_SERIAL),
         )
+
+    @property
+    def available(self) -> bool:
+        """Stay available showing last known values until 24 h without sync."""
+        data = self.coordinator.data
+        if not data:
+            return False
+        last_sync_str = data.get("last_sync")
+        if not last_sync_str:
+            return False
+        try:
+            last_sync = datetime.fromisoformat(last_sync_str)
+            if last_sync.tzinfo is None:
+                last_sync = last_sync.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) - last_sync < timedelta(hours=24)
+        except (ValueError, TypeError):
+            return False
 
     @property
     def is_on(self) -> bool | None:

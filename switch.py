@@ -149,6 +149,14 @@ class WaterioSwitch(CoordinatorEntity[WaterioCoordinator], SwitchEntity):
         )
 
     @property
+    def available(self) -> bool:
+        """Unavailable when BLE device is not reachable (can't write settings)."""
+        data = self.coordinator.data
+        if not data:
+            return False
+        return bool(data.get("ble_reachable", False))
+
+    @property
     def is_on(self) -> bool | None:
         if self.coordinator.data is None:
             return None

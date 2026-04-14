@@ -273,9 +273,16 @@ class WaterioSensor(CoordinatorEntity[WaterioCoordinator], SensorEntity):
 
     @property
     def available(self) -> bool:
-        """Mark unavailable if last successful sync was more than 24 hours ago."""
-        if not super().available:
-            return False
+        """Mark unavailable only if we have NEVER synced or last sync > 24 h ago.
+
+        We intentionally do NOT check super().available here.  When the bottle
+        is out of BLE range the coordinator poll fails and
+        ``last_update_success`` goes False, but we still want all sensors to
+        show their last known values (and *especially* ``last_sync``) so the
+        user can see when the bottle was last reachable.  Sensors only go
+        "unavailable" once the data is truly stale (>24 h since last sync)
+        or when there has never been a successful sync.
+        """
         data = self.coordinator.data
         if not data:
             return False
