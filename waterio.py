@@ -1711,8 +1711,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._daily_today_date          = today
             self._daily_accumulated_ml      = 0
             self._daily_accumulated_drinks  = today_drinks
-            self._daily_baseline_cap_ml     = cap_ml
-            self._daily_baseline_manual     = manual_ml
+            self._daily_baseline_cap_ml     = 0
+            self._daily_baseline_manual     = 0
             # Preserve last-drink info only if log produced a drink today
             if not today_drinks:
                 self._daily_last_drink_ml   = 0
@@ -1720,28 +1720,26 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Preserve water_remaining — bottle still has water from yesterday
             if self._daily_water_remaining <= 0:
                 self._daily_water_remaining = bottle_cap
-            self._prev_cap_ml               = cap_ml
+            self._prev_cap_ml               = 0
             # Fall through — compute totals correctly below instead of returning early
 
-        # ── CLEAR_LOGS detection: cap_ml dropped vs previous poll ───────────
-        # CLEAR_LOGS resets the device counters back to 0.  On the next poll
-        # cap_ml is already the NEW reading above the 0 reset point, so the
-        # baseline must be set to 0 (not cap_ml) so that delta_cap = cap_ml
-        # correctly accounts for ALL drinks since the reset.
-        # Setting baseline = cap_ml (the old bug) would make delta_cap = 0 and
-        # lose every drink that happened after CLEAR_LOGS until the NEXT sync.
-        if cap_ml < self._prev_cap_ml - 20:
-            segment_ml = max(0, self._prev_cap_ml - self._daily_baseline_cap_ml)
-            self._daily_accumulated_ml  += segment_ml
-            self._daily_baseline_cap_ml  = 0   # device counter reset to 0
-            self._daily_baseline_manual  = 0   # manual counter also resets on CLEAR_LOGS
-            LOGGER.info(
-                "Counter reset detected: +%dmL segment → accumulated=%dmL  new_baseline=0",
-                segment_ml, self._daily_accumulated_ml,
-            )
-            self._persist_baseline()
+        # ── CLEAR_LOGS-aware accounting ─────────────────────────────────────
+        # CLEAR_LOGS fires at the end of EVERY successful sync, resetting
+        # the device's cap_ml and manual_ml counters to 0.  So each poll's
+        # cap_ml/manual_ml represents consumption during exactly ONE inter-
+        # sync interval (from the previous CLEAR_LOGS to now).
+        #
+        # Previous code tried to detect the counter reset by comparing
+        # cap_ml < prev_cap_ml and computing segments.  This was fragile:
+        #   - If you drank less this interval than last, it falsely detected
+        #     a reset and re-added the previous interval (x2 bug).
+        #   - If the amounts were close, it missed the reset entirely.
+        #
+        # New approach: simply use cap_ml and manual_ml directly as this
+        # interval's delta, add to accumulated from previous intervals,
+        # then prepare baselines for the post-CLEAR state.
 
-        # ── Drink / refill detection ─────────────────────────────────────────
+        # ── Drink / refill detection (cap_ml delta, fallback only) ──────────
         # When the log gave us real L/U/Ð entries: _read_logs_async already
         # processed every drink and refill event in order, updated
         # _daily_accumulated_drinks / _daily_last_drink_* / _daily_water_remaining,
@@ -1749,43 +1747,40 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # cap_ml-delta heuristic to avoid double-counting.
         #
         # When no log entries were available fall back to cap_ml deltas:
-        delta_since_last = cap_ml - self._prev_cap_ml
-        if not self._water_level_from_log and delta_since_last > 5:
+        if not self._water_level_from_log and cap_ml > 5:
             remaining_before = self._daily_water_remaining
 
-            if delta_since_last > remaining_before + 10:
+            if cap_ml > remaining_before + 10:
                 # Consumed more than what was in the bottle → refill(s) happened.
                 available = remaining_before
                 n_refills = 0
-                while available < delta_since_last:
+                while available < cap_ml:
                     available += bottle_cap
                     n_refills += 1
-                new_remaining = available - delta_since_last
+                new_remaining = available - cap_ml
                 LOGGER.info(
                     "Refill detected (cap_ml): consumed %dmL > remaining %dmL → "
                     "%d refill(s)  new_remaining=%dmL",
-                    delta_since_last, remaining_before, n_refills, new_remaining,
+                    cap_ml, remaining_before, n_refills, new_remaining,
                 )
                 self._daily_water_remaining = max(0, new_remaining)
             else:
-                self._daily_water_remaining = max(0, remaining_before - delta_since_last)
+                self._daily_water_remaining = max(0, remaining_before - cap_ml)
 
             self._daily_accumulated_drinks += 1
-            self._daily_last_drink_ml = delta_since_last
+            self._daily_last_drink_ml = cap_ml
             self._daily_last_drink_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
             LOGGER.info(
-                "New drink detected (cap_ml): +%dmL (cap %d→%d)  drink #%d today  remaining=%dmL",
-                delta_since_last, self._prev_cap_ml, cap_ml,
-                self._daily_accumulated_drinks, self._daily_water_remaining,
+                "New drink detected (cap_ml fallback): +%dmL  drink #%d today  remaining=%dmL",
+                cap_ml, self._daily_accumulated_drinks, self._daily_water_remaining,
             )
 
-        self._prev_cap_ml = cap_ml
         self._water_level_from_log = False  # reset for next poll
 
         # ── Compute totals ──────────────────────────────────────────────────
-        delta_cap    = max(0, cap_ml    - self._daily_baseline_cap_ml)
-        delta_manual = max(0, manual_ml - self._daily_baseline_manual)
-        water_ml     = self._daily_accumulated_ml + delta_cap + delta_manual
+        # cap_ml and manual_ml are this interval's consumption (since last CLEAR_LOGS).
+        # accumulated_ml holds the sum of all previous intervals today.
+        water_ml = self._daily_accumulated_ml + cap_ml + manual_ml
 
         # ── Write all entities ──────────────────────────────────────────────
         self._data[FIELD_WATER_ML]          = water_ml
@@ -1806,6 +1801,17 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._daily_last_drink_ml, self._daily_last_drink_ts or "?",
             self._daily_water_remaining,
         )
+
+        # ── Prepare for next poll (post-CLEAR_LOGS) ─────────────────────────
+        # CLEAR_LOGS fires at the end of every _fetch_protocol_data, resetting
+        # the device's cap_ml and manual_ml counters to 0.  Fold this interval
+        # into accumulated_ml so the next poll starts clean.
+        self._daily_accumulated_ml = water_ml
+        self._prev_cap_ml = 0
+        # Baselines no longer needed (we use cap_ml directly), but keep at 0
+        # for persistence consistency.
+        self._daily_baseline_cap_ml = 0
+        self._daily_baseline_manual = 0
 
         # Persist after every poll so HA restart recovers everything
         self._persist_baseline()
