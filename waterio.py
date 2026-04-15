@@ -536,6 +536,16 @@ _GOAL_INDEX_ML: tuple[int, ...] = (
 # From SDK BottleVolumeType.java: 0=500mL, 1=750mL.
 _BOTTLE_VOLUME_ML: dict[int, int] = {0: 500, 1: 750}
 
+# BLE-read-only fields persisted under "_snap_<field>" in config entry options
+# so sensors show last-known values instead of "Unknown" after an HA restart.
+_SNAP_FIELDS: tuple[str, ...] = (
+    FIELD_BATTERY, FIELD_FIRMWARE, FIELD_HARDWARE,
+    FIELD_MANUFACTURER, FIELD_SERIAL,
+    FIELD_CAP_CLOSED, FIELD_IS_ACTIVE, FIELD_NEED_DRINK,
+    FIELD_IS_CHARGING, FIELD_HYDRATION_STATUS, FIELD_BATTERY_CELL,
+    FIELD_SILENT_MODE, FIELD_MAC_ADDRESS, FIELD_LAST_SYNC,
+)
+
 def _goal_index_to_ml(index: int) -> int | None:
     """Map a device goal-index byte to mL, or None if index is out of range."""
     if 0 <= index < len(_GOAL_INDEX_ML):
@@ -1003,6 +1013,28 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._pre_fetch_drinks: int = 0
         # Mutex to serialise all BLE connect/disconnect sessions.
         self._ble_lock: asyncio.Lock = asyncio.Lock()
+
+        # ── Restore last-known state so sensors are not "Unknown" on restart ──
+        # Computed hydration fields can be reconstructed from the accumulators
+        # that were just restored above.  No BLE needed.
+        if self._daily_today_date is not None:  # skip on very first boot
+            _goal_ml = int(self._settings.get(FIELD_DAILY_GOAL_ML, 2000)) or 2000
+            self._data[FIELD_WATER_ML]          = self._daily_accumulated_ml
+            self._data[FIELD_DRINK_COUNT_TODAY]  = self._daily_accumulated_drinks
+            self._data[FIELD_LAST_DRINK_ML]      = self._daily_last_drink_ml
+            self._data[FIELD_LAST_DRINK_TS]      = self._daily_last_drink_ts or None
+            self._data[FIELD_WATER_REMAINING_ML] = self._daily_water_remaining
+            self._data[FIELD_HYDRATION_LEVEL]    = min(
+                100, round(self._daily_accumulated_ml / _goal_ml * 100)
+            )
+
+        # BLE-read-only fields (battery, firmware, flags, …) are persisted under
+        # "_snap_<field>" keys and restored here so sensors show stale data
+        # rather than "Unknown" until the first successful BLE sync.
+        for _f in _SNAP_FIELDS:
+            _v = opts.get(f"_snap_{_f}")
+            if _v is not None:
+                self._data[_f] = _v
 
         # Populate journal entry count from existing file so the sensor shows
         # the correct count immediately on startup (before the first sync).
@@ -1948,6 +1980,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             new_options["_water_remaining"]     = self._daily_water_remaining
             new_options["_prev_cap_ml"]         = self._prev_cap_ml
             new_options["_baseline_date"]       = self._daily_today_date.isoformat() if self._daily_today_date else ""
+            # Snapshot BLE-read-only fields so they survive HA restarts
+            for _f in _SNAP_FIELDS:
+                _v = self._data.get(_f)
+                if _v is not None:
+                    new_options[f"_snap_{_f}"] = _v
             self.hass.config_entries.async_update_entry(self.config_entry, options=new_options)
         except Exception:
             pass  # Could not persist daily baseline
