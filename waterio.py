@@ -38,6 +38,7 @@ from .const import (
     CMD_GET_MAC_ADDRESS,
     CMD_CLEAR_LOGS,
     CMD_GET_SINGLE_MEAS,
+    CMD_START_BLINK, CMD_START_VIBRATION,
     CMD_SET_EXTRA_DAILY_GOAL, CMD_GET_EXTRA_DAILY_GOAL,
     # Field keys
     FIELD_BATTERY, FIELD_WATER_ML,
@@ -1469,10 +1470,14 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.hass.config_entries.async_update_entry(self.config_entry, options=new_options)
 
     async def async_find_bottle(self) -> None:
-        """Flash the bottle LED to locate it (GET_SINGLE_MEAS triggers a brief LED cycle)."""
-        pkt = make_cmd(CMD_GET_SINGLE_MEAS, b"", size=4)
-        if await self._ble_write(lambda: pkt, raise_on_disconnect=False):
-            LOGGER.info("Find bottle command sent to %s", self._mac)
+        """Locate the bottle with LED blink + vibration (matches original app behaviour)."""
+        # 1. Start LED blink — opcode 0x1A, DEFAULT pattern [0x00, 0x00]
+        blink_pkt = make_cmd(CMD_START_BLINK, bytes([0x00, 0x00]), size=5)
+        await self._ble_write(lambda: blink_pkt, raise_on_disconnect=False)
+        # 2. Start vibration — opcode 0x77, intensity as LE uint16 (500 ≈ medium pulse)
+        vib_pkt = make_cmd(CMD_START_VIBRATION, struct.pack("<H", 500), size=6)
+        if await self._ble_write(lambda: vib_pkt, raise_on_disconnect=False):
+            LOGGER.info("Find bottle (blink + vibrate) sent to %s", self._mac)
 
     async def async_set_extra_goal(self, ml: int) -> None:
         """Set extra daily hydration goal via dedicated CMD_SET_EXTRA_DAILY_GOAL command."""

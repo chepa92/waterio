@@ -127,6 +127,9 @@ CMD_SET_SILENT_MODE    = 0x66   # SET_SILENT_MODE_COMMAND; payload byte = 1/0
 CMD_GET_OFFSET_CAL     = 0x62   # GET_OFFSET_CALIBRATION_COMMAND
 CMD_ENTER_BOOTLOADER   = 0x99   # ENTER_BOOTLOADER_COMMAND (do not send!)
 CMD_GET_SINGLE_MEAS    = 0x01   # GET_SINGLE_MEASUREMENT_ASYNC; ACK 0x5A
+CMD_START_BLINK        = 0x1A   # START_BLINK_COMMAND; payload: [0,0] default / [1,1] good / [1,0] bad
+CMD_START_VIBRATION    = 0x77   # START_VIBRATION_COMMAND; payload: LE uint16 intensity/duration
+CMD_TURN_LEDS_ON       = 0x64   # TURN_LEDS_ON_COMMAND; payload: [len,R,G,B,...,pattern]; ACK 0x5A
 
 # ── Hydration / goal control ───────────────────────────────────────────────
 CMD_SET_MANUALLY_HYDRATION = 0x71   # SET_MANUALLY_HYDRATION_COMMAND; payload LE uint16 ml
