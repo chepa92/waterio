@@ -1429,7 +1429,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Save ALL raw entries to the journal file BEFORE CLEAR_LOGS wipes
             # the device.  This happens even if the hydration processing below
             # crashes, so we never lose data.
-            self._save_journal(all_entries)
+            await self._save_journal(all_entries)
 
             # ── Process log entries ─────────────────────────────────────────
             #
@@ -1617,6 +1617,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         async with self._ble_lock:
             if not await self._ensure_connected():
                 # Device not reachable — return last known data if we have any
+                self._data["ble_reachable"] = False
                 if self._data.get(FIELD_LAST_SYNC):
                     LOGGER.info(
                         "BLE connect failed – returning last known data  "
@@ -1629,6 +1630,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise UpdateFailed(f"Cannot connect to Water.io cap {self._mac}")
 
             try:
+                # Mark BLE reachable immediately so every mid-sync
+                # async_set_updated_data() call (from _on_notification) carries
+                # ble_reachable=True.  Without this, writable entities flicker
+                # "unavailable" on every intermediate notification during the sync.
+                self._data["ble_reachable"] = True
                 await self._read_standard_gatt()      # battery, firmware, manufacturer …
                 # Snapshot drink counter BEFORE log reading so new-day reset can
                 # distinguish persisted-yesterday count from today's log entries.
@@ -1810,7 +1816,19 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         mac_clean = self._mac.replace(":", "").upper()
         return self.hass.config.path(f"waterio_journal_{mac_clean}.json")
 
-    def _save_journal(self, all_entries: list[dict]) -> None:
+    def _journal_write_blocking(self, session: dict, path: str) -> int:
+        """Blocking file I/O — must be called via run_in_executor only."""
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                journal: list = json.load(f)
+        else:
+            journal = []
+        journal.append(session)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(journal, f, ensure_ascii=False, indent=2)
+        return sum(s.get("log_count", 0) for s in journal)
+
+    async def _save_journal(self, all_entries: list[dict]) -> None:
         """Append this sync session's raw log entries to the journal JSON file.
 
         File lives at <HA config>/waterio_journal_<MAC>.json.
@@ -1845,15 +1863,9 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         path = self._journal_path
         try:
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    journal: list = json.load(f)
-            else:
-                journal = []
-            journal.append(session)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(journal, f, ensure_ascii=False, indent=2)
-            total = sum(s.get("log_count", 0) for s in journal)
+            total = await self.hass.async_add_executor_job(
+                self._journal_write_blocking, session, path
+            )
             self._data[FIELD_JOURNAL_ENTRIES] = total
             LOGGER.info(
                 "Journal: +%d entries saved  total=%d  path=%s",
@@ -1866,13 +1878,14 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Delete the journal file (called by the Clear Journal button)."""
         path = self._journal_path
         try:
-            if os.path.exists(path):
-                os.remove(path)
-                LOGGER.info("Journal cleared: %s", path)
-            self._data[FIELD_JOURNAL_ENTRIES] = 0
-            self.async_set_updated_data(dict(self._data))
+            await self.hass.async_add_executor_job(os.remove, path)
+            LOGGER.info("Journal cleared: %s", path)
+        except FileNotFoundError:
+            pass
         except Exception as exc:
             LOGGER.warning("Journal clear failed: %s", exc)
+        self._data[FIELD_JOURNAL_ENTRIES] = 0
+        self.async_set_updated_data(dict(self._data))
 
     def _persist_baseline(self) -> None:
         """Save the current daily baseline into config entry options so it
