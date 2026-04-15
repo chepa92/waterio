@@ -1,15 +1,15 @@
 import asyncio
 from datetime import timedelta
-from .waterio import discover
 from typing import Any
 
 from homeassistant import config_entries
+from homeassistant.components.bluetooth import async_discovered_service_info
 from homeassistant.const import CONF_MAC
 import voluptuous as vol
 from homeassistant.helpers.device_registry import format_mac
 
 from .const import (
-    DOMAIN, LOGGER, UPDATE_INTERVAL,
+    DEVICE_NAME_PREFIX, DOMAIN, LOGGER, UPDATE_INTERVAL,
 )
 
 CONF_POLL_INTERVAL = "poll_interval"
@@ -42,8 +42,14 @@ class WaterIoFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_create_entry(title=self.name, data={CONF_MAC: self.mac, "name": self.name})
 
         already_configured = self._async_current_ids(False)
-        devices = await discover()
-        devices = [device for device in devices if format_mac(device.address) not in already_configured]
+        # Use HA's already-running BLE scanner instead of launching a new one.
+        # async_discovered_service_info() is instantaneous — no 10 s scan needed.
+        all_infos = async_discovered_service_info(self.hass, connectable=True)
+        devices = [
+            info for info in all_infos
+            if info.name and info.name.startswith(DEVICE_NAME_PREFIX)
+            and format_mac(info.address) not in already_configured
+        ]
 
         if not devices:
             return await self.async_step_manual()
@@ -53,7 +59,7 @@ class WaterIoFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 {
                     vol.Required("mac"): vol.In(
                         {
-                            **{device.address: device.name for device in devices},
+                            **{info.address: info.name for info in devices},
                             MANUAL_MAC: "Manually add a MAC address",
                         }
                     ),
