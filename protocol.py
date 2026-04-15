@@ -372,15 +372,22 @@ def parse_notification(data: bytearray) -> dict[str, Any]:
                 )
 
         elif opcode == RESP_GET_HYDRATIONS:
-            # 0x72: cumulative totals since last CLEAR_LOGS.
-            # [4..5] = totalManuallyHydrations LE uint16  (ml, cumulative)
-            # [6..7] = totalCapHydrations       LE uint16  (ml, cumulative)
+            # 0x72: cumulative totals since last CLEAR_LOGS (interval only).
+            # [4..5] = totalManuallyHydrations LE uint16  (ml, since CLEAR_LOGS)
+            # [6..7] = totalCapHydrations       LE uint16  (ml, since CLEAR_LOGS)
+            #
+            # DO NOT set FIELD_CAP_ML here — GET_SYNC_INFO (0x78) is the sole
+            # authoritative source for the daily cumulative counter.  Writing
+            # the interval-only value to FIELD_CAP_ML during the sync causes
+            # the TOTAL_INCREASING sensor to see a transient drop (e.g. 2370
+            # → 490) followed by a rise (→ 2860), which corrupts HA's
+            # statistics reset-detection and inflates the displayed total.
             if len(data) >= 8:
                 manual_ml = struct.unpack_from("<H", data, 4)[0]
                 cap_ml    = struct.unpack_from("<H", data, 6)[0]
-                result[FIELD_MANUAL_ML] = manual_ml if manual_ml < 0xFFFF else 0
-                result[FIELD_CAP_ML]    = cap_ml    if cap_ml    < 0xFFFF else 0
-                LOGGER.info("Hydrations (cumulative): manual=%dmL  cap=%dmL", manual_ml, cap_ml)
+                result["_interval_manual_ml"] = manual_ml if manual_ml < 0xFFFF else 0
+                result["_interval_cap_ml"]    = cap_ml    if cap_ml    < 0xFFFF else 0
+                LOGGER.info("Hydrations (interval since CLEAR_LOGS): manual=%dmL  cap=%dmL", manual_ml, cap_ml)
 
         elif opcode == RESP_GET_SYNC_INFO:
             # 0x78: GetSyncInfoCommand.java — plen=8 for pv=12, layout CONFIRMED:

@@ -119,31 +119,36 @@ async def discover() -> list[BLEDevice]:
 #   This ensures water_remaining always reflects the physical bottle state
 #   regardless of sync gap, while the "drinks today" counter stays accurate.
 #
-# â”€â”€ CAP_ML COUNTER BEHAVIOR & DELTA ACCOUNTING â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- CAP_ML COUNTER & "Water Consumed (Total)" SENSOR -----------------------
 #
-#   cap_ml is reported by GET_HYDRATIONS (0x72) and GET_SYNC_INFO (0x78).
-#   GET_CAP_STATE (0x3C) bytes[14..15] on pv<15 is the daily GOAL, NOT
-#   consumption (this was a previous source of inflation bugs).
+#   IMPORTANT: The original Water.io app does NOT use GET_HYDRATIONS (0x72)
+#   or GET_SYNC_INFO (0x78) counters for the daily water display.  It relies
+#   ENTIRELY on summing drink deltas from log entries ('l' and U+00DC).
+#   GET_SYNC_INFO is used only for post-sync diagnostic verification
+#   (checkCapSync).  GET_HYDRATIONS is an on-demand Flutter query, not part
+#   of the automatic sync flow.
 #
-#   GET_HYDRATIONS resets on CLEAR_LOGS; GET_SYNC_INFO may be daily-cumulative.
-#   Because both write FIELD_CAP_ML and the last-arriving BLE notification
-#   wins, cap_ml can flip between reset and cumulative values across syncs.
+#   Our "Water Consumed (Total)" sensor (FIELD_CAP_ML) is an HA-specific
+#   addition that exposes the raw device counter for HA's statistics/energy
+#   dashboard.  It uses SensorStateClass.TOTAL_INCREASING so HA computes
+#   daily/weekly bar charts automatically.
 #
-#   PRIMARY: when log entries are available, _process_log_entries adds each
-#   drink's mL directly into _daily_accumulated_ml.  _compute_daily_water
-#   then skips delta_cap entirely (had_log_data=True path).
+#   FIELD_CAP_ML sourcing:
+#     - GET_SYNC_INFO (0x78) bytes[10..11] = daily cumulative cap mL
+#       This is the SOLE authoritative source for FIELD_CAP_ML.
+#     - GET_HYDRATIONS (0x72) bytes[6..7] = interval mL since CLEAR_LOGS
+#       This resets to 0 after every sync.  It is stored as _interval_cap_ml
+#       (internal only) and NEVER written to FIELD_CAP_ML.
+#     - GET_CAP_STATE (0x3C) bytes[14..15] on pv<15 = daily GOAL (not consumption!)
+#       NOT used for FIELD_CAP_ML.
 #
-#   FALLBACK: _compute_daily_water() uses DELTA accounting:
-#     delta_cap = cap_ml âˆ’ _prev_cap_ml
-#     if delta_cap < 0 â†’ genuine counter reset; treat delta_cap = cap_ml
-#   This handles both "cap_ml resets" and "cap_ml is cumulative" correctly
-#   and never double-counts regardless of CLEAR_LOGS behaviour.
+#   Intermediate notification pushes (async_set_updated_data during sync)
+#   suppress FIELD_CAP_ML and FIELD_MANUAL_ML to prevent the TOTAL_INCREASING
+#   sensor from seeing transient drops (interval value < daily cumulative)
+#   which corrupt HA's reset-detection statistics.  The final stable values
+#   are delivered in the coordinator return dict at end of sync.
 #
-#   _prev_cap_ml is persisted as "_baseline_cap_ml" in config entry options
-#   so HA restarts within the same day continue from the right position.
-#   On a new calendar day _prev_cap_ml is set to the current cap_ml value
-#   (baseline = whatever the device reports at midnight) so the first delta
-#   of the new day is 0 (safe start).
+#   For "Water Intake Today" (FIELD_WATER_ML), see DRINK COUNTING below.
 #
 # â”€â”€ PERSISTENCE & VERSION MIGRATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #
@@ -162,24 +167,37 @@ async def discover() -> list[BLEDevice]:
 #   reflects physical state).  This prevents carryover of inflated counts
 #   from older buggy code.
 #
-# â”€â”€ DRINK COUNTING â€” TWO DATA SOURCES (ONE ACTIVE) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- DRINK COUNTING (SDK-VERIFIED) ------------------------------------------
 #
-#   1. 'l' (VOLUME_AS_ML) log entry deltas    â† PRIMARY, used when available
-#      prev_level âˆ’ current_level â‰¥ 30 mL = 1 drink.  Matches original SDK:
-#      ReadLogsCommand case 'l' â†’ HydrationRepo.m3823q().  'L'/'U' entries
-#      only update water_remaining (prev_level) but never trigger a drink.
+#   Original SDK behavior (HydrationRepo.m3823q / ReadLogsCommand.java):
+#     - ONLY log entries are used for the daily water total
+#     - GET_HYDRATIONS / GET_SYNC_INFO counters are NOT used for display
+#     - Daily total = SUM(amount) from hydration_table Room DB
+#     - Each 'amount' = prev_level - current_level from consecutive entries
 #
-#   2. delta_cap (cap_ml âˆ’ prev_cap_ml) fallback   â† FALLBACK only
-#      Used ONLY when _water_level_from_log is False (no 'l' log entries).
-#      Fires in _compute_daily_water() for housekeeping-only syncs.
-#      See "CAP_ML COUNTER BEHAVIOR" section above for delta formula.
+#   Data sources:
 #
-#   'Ãœ' (0xDC HYDRATION_V2) is NOT used: the original SDK m3822p() is gated
-#   on a cloud-sync / premium flag (m3818k) that is never set in HA context.
-#   Using it would double-count every sip because 'l' entries already appear.
+#   1. 'l' (VOLUME_AS_ML) log entry deltas    <- PRIMARY
+#      prev_level - current_level >= 30 mL = 1 drink.
+#      SDK: ReadLogsCommand case 'l' -> HydrationRepo.m3823q().
+#      level=0 is valid (empty bottle) - original SDK has NO level<=0 guard.
+#      'L'/'U' entries only update prev_level/water_remaining, never drinks.
 #
-#   _water_level_from_log flag prevents double-counting: set True after
-#   processing 'l'/'Ã' entries, reset to False after _compute_daily_water.
+#   2. delta_cap (cap_ml - prev_cap_ml) fallback   <- HA-ONLY FALLBACK
+#      NOT in the original SDK.  Used ONLY when _water_level_from_log is
+#      False (no 'l' log entries in this sync - housekeeping-only polls).
+#      See "CAP_ML COUNTER" section above for the delta formula.
+#
+#   3. 'U+00DC' (0xDC HYDRATION_V2) via m3822p()  <- PARTIALLY USED BY SDK
+#      The original SDK DOES process 'U+00DC' entries (extraData * 5 = mL).
+#      Our code currently ignores them because m3822p() appeared to be gated
+#      on a premium/cloud-sync flag (m3818k).  This may cause undercounting
+#      if the device sometimes sends 'U+00DC' without a matching 'l' entry.
+#      TODO: investigate whether pv=12 firmware always pairs 'U+00DC' with 'l'.
+#
+#   _water_level_from_log flag prevents double-counting between log-based
+#   and cap_ml-delta paths: set True after processing log entries, checked
+#   in _compute_daily_water to skip delta_cap when logs were available.
 #
 # â”€â”€ L/U RAW ADC NOTE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #
@@ -394,7 +412,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _bottle = BOTTLE_VOLUME_ML.get(
                         self._data.get("bottle_volume_type", 0), 500
                     )
-                    if 0 < level <= _bottle * 2:
+                    if 0 <= level <= _bottle * 2:
                         self._daily_water_remaining = level
                         self._data[FIELD_WATER_REMAINING_ML] = level
                         LOGGER.info("Real-time measurement: type=%s  remaining=%dmL", ev, level)
@@ -410,17 +428,32 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Don't let intermediate notifications overwrite computed fields
             # that _compute_daily_water manages (prevents 0% hydration_level
             # flicker and stale water_ml from raw device bytes).
-            # NOTE: FIELD_LOG_COUNT is NOT suppressed â€” _read_logs_async needs
+            # NOTE: FIELD_LOG_COUNT is NOT suppressed - _read_logs_async needs
             # it in self._data to know how many log entries to read.
-            for key in (FIELD_HYDRATION_LEVEL, FIELD_WATER_ML,
-                        FIELD_DRINK_COUNT_TODAY, FIELD_LAST_DRINK_ML,
-                        FIELD_LAST_DRINK_TS, FIELD_WATER_REMAINING_ML,
-                        FIELD_DAILY_GOAL_ML):
-                parsed.pop(key, None)
+            #
+            # FIELD_CAP_ML and FIELD_MANUAL_ML are also suppressed from
+            # intermediate pushes.  GET_HYDRATIONS (interval) and GET_SYNC_INFO
+            # (daily cumulative) both try to set these fields, and pushing a
+            # transient interval value (e.g. 490) < the previous daily cumulative
+            # (e.g. 2370) during the sync causes the TOTAL_INCREASING sensor's
+            # statistics to detect a false reset and inflate the displayed total.
+            # The fields STILL get stored in self._data (update happens before
+            # the push filtering), so _compute_daily_water sees the latest values.
+            _SUPPRESS_FROM_PUSH = {
+                FIELD_HYDRATION_LEVEL, FIELD_WATER_ML,
+                FIELD_DRINK_COUNT_TODAY, FIELD_LAST_DRINK_ML,
+                FIELD_LAST_DRINK_TS, FIELD_WATER_REMAINING_ML,
+                FIELD_DAILY_GOAL_ML,
+                FIELD_CAP_ML, FIELD_MANUAL_ML,
+            }
+            # Update self._data with ALL parsed fields (including cap_ml)
+            # so _compute_daily_water sees the latest values from the device.
             self._data.update(parsed)
-            # Push full self._data to HA â€” the suppressed fields keep their
-            # existing values from _compute_daily_water / startup restore.
-            self.async_set_updated_data(dict(self._data))
+            # Build a push dict WITHOUT suppressed fields - entities for those
+            # get their final stable values from the coordinator return dict
+            # at the end of the sync cycle (_async_update_data return).
+            push = {k: v for k, v in self._data.items() if k not in _SUPPRESS_FROM_PUSH}
+            self.async_set_updated_data(push)
 
     # ------------------------------------------------------------------
     # Internal BLE helpers
@@ -900,8 +933,12 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ev    = entry["type"]
             level = entry["level"]
             extra = entry["extra"]
-            if level <= 0 or level >= 0xFFFF:
+            if level < 0 or level >= 0xFFFF:
                 continue
+            # level=0 is valid for 'l' (VOLUME_AS_ML) — means bottle is empty.
+            # For L/U (raw ADC), 0 is technically impossible but harmless:
+            # L/U are not in _DRINK_OPCODES and the _MAX_SANE_ML guard below
+            # handles ADC range filtering.
             if level > _MAX_SANE_ML:
                 LOGGER.info(
                     "Skipping entry type=%s level=%d (> %d, likely raw ADC)  raw=%s",
