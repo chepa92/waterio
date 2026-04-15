@@ -219,6 +219,7 @@ FIELD_SHABBAT_MODE      = "enable_shabbat_mode"     # bool (type 50)
 FIELD_LED_OFF_CHARGER   = "led_off_in_charger"      # bool (type 52)
 FIELD_BOTTLE_VOLUME     = "bottle_volume_type"      # uint8: 0=500mL,1=750mL (type 53)
 FIELD_REMINDER_COLOR    = "reminder_color_rgb"      # str: "#RRGGBB" LED color (type 30)
+FIELD_JOURNAL_ENTRIES   = "journal_entry_count"     # int: total log entries stored in journal
 
 # -------------------------------------------------------------------
 # TypeConfig registry

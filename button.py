@@ -37,6 +37,12 @@ BUTTON_DESCRIPTIONS: tuple[WaterioButtonDescription, ...] = (
         icon="mdi:sync",
         action="sync",
     ),
+    WaterioButtonDescription(
+        key="clear_journal",
+        name="Clear Journal",
+        icon="mdi:book-remove",
+        action="clear_journal",
+    ),
 )
 
 
@@ -83,8 +89,8 @@ class WaterioButton(CoordinatorEntity[WaterioCoordinator], ButtonEntity):
 
     @property
     def available(self) -> bool:
-        """Sync stays pressable always; other buttons need BLE reachable."""
-        if self.entity_description.action == "sync":
+        """Sync and Clear Journal are always pressable (local ops, no BLE needed)."""
+        if self.entity_description.action in ("sync", "clear_journal"):
             return True
         data = self.coordinator.data
         if not data:
@@ -100,5 +106,8 @@ class WaterioButton(CoordinatorEntity[WaterioCoordinator], ButtonEntity):
         elif action == "sync":
             LOGGER.info("Force Sync pressed for %s", self.coordinator.mac)
             await self.coordinator.async_request_refresh()
+        elif action == "clear_journal":
+            LOGGER.info("Clear Journal pressed for %s", self.coordinator.mac)
+            await self.coordinator.async_clear_journal()
 
 

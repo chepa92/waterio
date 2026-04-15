@@ -29,7 +29,7 @@ from .const import (
     FIELD_DAILY_GOAL_ML, FIELD_EXTRA_GOAL_ML, FIELD_LAST_SYNC,
     FIELD_BATTERY_CELL, FIELD_DEVICE_CLOCK, FIELD_LOG_COUNT, FIELD_MAC_ADDRESS,
     FIELD_LAST_DRINK_ML, FIELD_LAST_DRINK_TS, FIELD_DRINK_COUNT_TODAY,
-    FIELD_WATER_REMAINING_ML,
+    FIELD_WATER_REMAINING_ML, FIELD_JOURNAL_ENTRIES,
 )
 from .waterio import WaterioCoordinator
 
@@ -221,6 +221,15 @@ SENSOR_DESCRIPTIONS: tuple[WaterioSensorDescription, ...] = (
         name="Hardware Version",
         icon="mdi:chip",
         enabled_default=False,
+        entity_cat=EntityCategory.DIAGNOSTIC,
+    ),
+    WaterioSensorDescription(
+        key="journal_entry_count",
+        field=FIELD_JOURNAL_ENTRIES,
+        name="Journal Entries",
+        native_unit_of_measurement="entries",
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:book-clock",
         entity_cat=EntityCategory.DIAGNOSTIC,
     ),
 )

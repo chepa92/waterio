@@ -218,10 +218,16 @@ class WaterioNumber(CoordinatorEntity[WaterioCoordinator], NumberEntity):
 
     @property
     def available(self) -> bool:
-        """Unavailable when BLE device is not reachable (can't write settings)."""
+        """Unavailable when BLE device is not reachable (can't write settings).
+
+        Exception: daily_goal_ml is stored locally in HA options and never
+        written to the device, so it stays available regardless of BLE state.
+        """
         data = self.coordinator.data
         if not data:
             return False
+        if self.entity_description.field == FIELD_DAILY_GOAL_ML:
+            return True  # local-only setting; no BLE required
         return bool(data.get("ble_reachable", False))
 
     @property

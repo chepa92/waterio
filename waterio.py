@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import struct
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -57,7 +59,7 @@ from .const import (
     FIELD_LAST_DRINK_ML, FIELD_LAST_DRINK_TS, FIELD_DRINK_COUNT_TODAY,
     FIELD_WATER_REMAINING_ML,
     FIELD_HYDRATION_LEVEL, FIELD_REMINDER_COLOR,
-    FIELD_BOTTLE_VOLUME,
+    FIELD_BOTTLE_VOLUME, FIELD_JOURNAL_ENTRIES,
     # TypeConfig
     TYPECONFIG_FIELDS, FIELD_TO_TYPEBYTE,
     DEFAULT_SETTINGS,
@@ -541,6 +543,30 @@ def _build_read_logs_cmd(offset: int, count: int = 1) -> bytearray:
     return _make_cmd(CMD_READ_LOGS, payload, size=8)
 
 
+# Human-readable names for every log entry opCode (ReadLogsCommand.java m4145w switch)
+_OPCODE_NAMES: dict[str, str] = {
+    'A': 'CONNECTED',            'B': 'CALIBRATED',           'C': 'CLOSED_CAP',
+    'D': 'DISCONNECTED',         'E': 'MEASURE_NOT_VALID',    'F': 'TEMPERATURE',
+    'G': 'BUTTON_PRESSED',       'H': 'HYDRATION_CHECK',
+    'L': 'MEASUREMENT_ACCURATE', 'M': 'MEASURE_EVENT',        'N': 'LAST_VOLUME_EVENT',
+    'O': 'OPENED_CAP',           'P': 'PAIR',                 'Q': 'REMINDER_SEQUENCE',
+    'R': 'REMINDER',             'S': 'START_SHAKE',          'T': 'EXIT_HIGH_TEMP',
+    'U': 'MEASUREMENT_ESTIMATED','V': 'VOLTAGE',              'X': 'SCHEDULER_EVENT',
+    'Y': 'LIQUID_TYPE',          'Z': 'RESET_DEVICE',         '^': 'SIGNAL_RATE',
+    '_': 'SIGNAL_RATE_MIN',      'c': 'TOP_CLOSE',            'g': 'STOP_TILT',
+    'h': 'SLEEP_DEVICE',         'l': 'VOLUME_AS_ML',         'o': 'TOP_OPEN',
+    'r': 'PRE_REMINDER',         's': 'STOP_SHAKE',           't': 'ENTER_HIGH_TEMP',
+    '\xc8': 'MEASUREMENT_COUNTERS',    '\xc9': 'UPDATE_MANUAL_HYDRATION',
+    '\xca': 'UPDATE_MEAS_HYDRATION',   '\xcb': 'UPDATE_EXTRA_GOAL',
+    '\xd0': 'FIRMWARE_REFILL',         '\xd1': 'SEQUENCE_PATTERN',
+    '\xd3': 'HYDRATION_STATE',         '\xd5': 'BOTTLE_NOT_STABLE',
+    '\xd6': 'RE_MEASURE',              '\xd7': 'EXIT_LOW_POWER',
+    '\xd8': 'EXIT_VERY_LOW_POWER',     '\xd9': 'CAP_OVERFLOW_MEMORY',
+    '\xda': 'LED_STATUS_COUNTER',      '\xdb': 'BACKUP_HEAP',
+    '\xdc': 'HYDRATION_V2',
+}
+
+
 def _parse_log_entry(raw8: bytes) -> dict:
     """
     Parse one 8-byte log entry payload from a READ_LOGS (0x0E) notification.
@@ -955,6 +981,21 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Mutex to serialise all BLE connect/disconnect sessions.
         self._ble_lock: asyncio.Lock = asyncio.Lock()
 
+        # Populate journal entry count from existing file so the sensor shows
+        # the correct count immediately on startup (before the first sync).
+        try:
+            _jp = self._journal_path
+            if os.path.exists(_jp):
+                with open(_jp, "r", encoding="utf-8") as _jf:
+                    _j = json.load(_jf)
+                self._data[FIELD_JOURNAL_ENTRIES] = sum(
+                    s.get("log_count", 0) for s in _j
+                )
+            else:
+                self._data[FIELD_JOURNAL_ENTRIES] = 0
+        except Exception:
+            self._data[FIELD_JOURNAL_ENTRIES] = 0
+
     # ------------------------------------------------------------------
     # Public properties (used by sensor entities)
     # ------------------------------------------------------------------
@@ -1010,10 +1051,15 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if parsed:
             # Don't let intermediate notifications overwrite computed fields
             # that _compute_daily_water manages (prevents 0% flicker).
+            # FIELD_LOG_COUNT is also excluded: a partial sync can receive the
+            # GET_LOG_LENGTH response (e.g. 104) and push it to coordinator.data
+            # via async_set_updated_data before the sync completes and clears it
+            # to 0 — resulting in a stale count showing in the UI after a failed
+            # sync.  Log count is only meaningful in the final polled result.
             for key in (FIELD_HYDRATION_LEVEL, FIELD_WATER_ML,
                         FIELD_DRINK_COUNT_TODAY, FIELD_LAST_DRINK_ML,
                         FIELD_LAST_DRINK_TS, FIELD_WATER_REMAINING_ML,
-                        FIELD_DAILY_GOAL_ML):
+                        FIELD_DAILY_GOAL_ML, FIELD_LOG_COUNT):
                 parsed.pop(key, None)
             self._data.update(parsed)
             # Push update to HA without waiting for the next poll cycle
@@ -1326,13 +1372,17 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             offset = 0
             while offset < log_count and len(all_entries) < _MAX_ENTRIES:
+                # Guard: BLE connection may have dropped mid-sync
+                if not self._client or not self._client.is_connected:
+                    LOGGER.warning("READ_LOGS: BLE disconnected at offset %d – aborting log read", offset)
+                    break
                 end = min(offset + _BATCH_SIZE, log_count)
                 pkt = _build_read_logs_cmd(offset, count=end - offset)
                 try:
                     await self._client.write_gatt_char(
                         self._write_char, pkt, response=False
                     )
-                except BleakError as exc:
+                except (BleakError, AttributeError) as exc:
                     LOGGER.warning("READ_LOGS batch @%d failed: %s", offset, exc)
                     break
 
@@ -1375,6 +1425,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "READ_LOGS: %d / %d entries read, types=%s",
                 len(all_entries), log_count, dict(types),
             )
+
+            # Save ALL raw entries to the journal file BEFORE CLEAR_LOGS wipes
+            # the device.  This happens even if the hydration processing below
+            # crashes, so we never lose data.
+            self._save_journal(all_entries)
 
             # ── Process log entries ─────────────────────────────────────────
             #
@@ -1663,13 +1718,19 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Fall through — compute totals correctly below instead of returning early
 
         # ── CLEAR_LOGS detection: cap_ml dropped vs previous poll ───────────
+        # CLEAR_LOGS resets the device counters back to 0.  On the next poll
+        # cap_ml is already the NEW reading above the 0 reset point, so the
+        # baseline must be set to 0 (not cap_ml) so that delta_cap = cap_ml
+        # correctly accounts for ALL drinks since the reset.
+        # Setting baseline = cap_ml (the old bug) would make delta_cap = 0 and
+        # lose every drink that happened after CLEAR_LOGS until the NEXT sync.
         if cap_ml < self._prev_cap_ml - 20:
             segment_ml = max(0, self._prev_cap_ml - self._daily_baseline_cap_ml)
             self._daily_accumulated_ml  += segment_ml
-            self._daily_baseline_cap_ml  = cap_ml
-            self._daily_baseline_manual  = manual_ml
+            self._daily_baseline_cap_ml  = 0   # device counter reset to 0
+            self._daily_baseline_manual  = 0   # manual counter also resets on CLEAR_LOGS
             LOGGER.info(
-                "Counter reset detected: +%dmL segment → accumulated=%dmL",
+                "Counter reset detected: +%dmL segment → accumulated=%dmL  new_baseline=0",
                 segment_ml, self._daily_accumulated_ml,
             )
             self._persist_baseline()
@@ -1742,6 +1803,76 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Persist after every poll so HA restart recovers everything
         self._persist_baseline()
+
+    @property
+    def _journal_path(self) -> str:
+        """Absolute path to the per-device journal JSON file."""
+        mac_clean = self._mac.replace(":", "").upper()
+        return self.hass.config.path(f"waterio_journal_{mac_clean}.json")
+
+    def _save_journal(self, all_entries: list[dict]) -> None:
+        """Append this sync session's raw log entries to the journal JSON file.
+
+        File lives at <HA config>/waterio_journal_<MAC>.json.
+        Structure: list of session objects, newest appended last.
+        Each session: { sync_ts, device_mac, log_count, entries[] }.
+        Each entry:   { ts, ts_iso, type, type_name, level, extra, raw }.
+        """
+        if not all_entries:
+            return
+        sync_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        session = {
+            "sync_ts": sync_ts,
+            "device_mac": self._mac,
+            "log_count": len(all_entries),
+            "entries": [
+                {
+                    "ts":        e["ts"],
+                    "ts_iso":    datetime.fromtimestamp(
+                                     e["ts"], tz=timezone.utc
+                                 ).isoformat(timespec="seconds"),
+                    "type":      e["type"],
+                    "type_name": _OPCODE_NAMES.get(
+                                     e["type"],
+                                     f"0x{ord(e['type']):02X}"
+                                 ),
+                    "level":     e["level"],
+                    "extra":     e["extra"],
+                    "raw":       e["raw"],
+                }
+                for e in all_entries
+            ],
+        }
+        path = self._journal_path
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    journal: list = json.load(f)
+            else:
+                journal = []
+            journal.append(session)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(journal, f, ensure_ascii=False, indent=2)
+            total = sum(s.get("log_count", 0) for s in journal)
+            self._data[FIELD_JOURNAL_ENTRIES] = total
+            LOGGER.info(
+                "Journal: +%d entries saved  total=%d  path=%s",
+                len(all_entries), total, path,
+            )
+        except Exception as exc:
+            LOGGER.warning("Journal save failed: %s", exc)
+
+    async def async_clear_journal(self) -> None:
+        """Delete the journal file (called by the Clear Journal button)."""
+        path = self._journal_path
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                LOGGER.info("Journal cleared: %s", path)
+            self._data[FIELD_JOURNAL_ENTRIES] = 0
+            self.async_set_updated_data(dict(self._data))
+        except Exception as exc:
+            LOGGER.warning("Journal clear failed: %s", exc)
 
     def _persist_baseline(self) -> None:
         """Save the current daily baseline into config entry options so it
