@@ -713,8 +713,20 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _MAX_ENTRIES = 2003  # SDK hard limit: f3009m.size() > 2002
 
         # Incremental read: skip entries already seen in previous syncs.
-        # If the device was reset (log_count decreased), start from 0.
-        start_offset = min(self._log_device_count, log_count)
+        # CLEAR_LOGS resets the device log counter to 0 after every sync,
+        # so the watermark (_log_device_count) should normally be 0 here.
+        # If the watermark exceeds log_count, the device was cleared and
+        # we MUST read from 0 — NOT from log_count (the old min() logic
+        # silently set start_offset = log_count, which hit the skip guard
+        # and discarded every entry forever).
+        if self._log_device_count > log_count:
+            LOGGER.info(
+                "READ_LOGS: watermark %d > device log_count %d — "
+                "device was cleared, resetting to 0",
+                self._log_device_count, log_count,
+            )
+            self._log_device_count = 0
+        start_offset = self._log_device_count
         if start_offset > 0:
             LOGGER.debug(
                 "READ_LOGS: incremental — skipping %d already-seen entries, "
