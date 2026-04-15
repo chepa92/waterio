@@ -1,4 +1,4 @@
-"""Water.io BLE coordinator â€“ reverse-engineered from APK v3.5.0 / v4.8.6 (latest)."""
+﻿"""Water.io BLE coordinator â€“ reverse-engineered from APK v3.5.0 / v4.8.6 (latest)."""
 from __future__ import annotations
 
 import asyncio
@@ -121,12 +121,19 @@ async def discover() -> list[BLEDevice]:
 #
 # â”€â”€ CAP_ML COUNTER BEHAVIOR & DELTA ACCOUNTING â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 #
-#   cap_ml is reported by GET_HYDRATIONS (0x72), GET_CAP_STATE (0x3C), and
-#   GET_SYNC_INFO (0x78).  Empirically, at least one of these reports a
-#   DAILY-CUMULATIVE value that keeps growing within the same day and is
-#   NOT reliably reset to 0 by CLEAR_LOGS.
+#   cap_ml is reported by GET_HYDRATIONS (0x72) and GET_SYNC_INFO (0x78).
+#   GET_CAP_STATE (0x3C) bytes[14..15] on pv<15 is the daily GOAL, NOT
+#   consumption (this was a previous source of inflation bugs).
 #
-#   _compute_daily_water() therefore uses DELTA accounting:
+#   GET_HYDRATIONS resets on CLEAR_LOGS; GET_SYNC_INFO may be daily-cumulative.
+#   Because both write FIELD_CAP_ML and the last-arriving BLE notification
+#   wins, cap_ml can flip between reset and cumulative values across syncs.
+#
+#   PRIMARY: when log entries are available, _process_log_entries adds each
+#   drink's mL directly into _daily_accumulated_ml.  _compute_daily_water
+#   then skips delta_cap entirely (had_log_data=True path).
+#
+#   FALLBACK: _compute_daily_water() uses DELTA accounting:
 #     delta_cap = cap_ml âˆ’ _prev_cap_ml
 #     if delta_cap < 0 â†’ genuine counter reset; treat delta_cap = cap_ml
 #   This handles both "cap_ml resets" and "cap_ml is cumulative" correctly
@@ -147,7 +154,7 @@ async def discover() -> list[BLEDevice]:
 #     _accumulated_ml   â€“ running water total up to the last poll
 #     _accumulated_drinks, _last_drink_ml, _last_drink_ts
 #     _water_remaining, _prev_cap_ml, _baseline_date
-#     _persist_version  â€“ currently 3
+#     _persist_version  â€“ currently 4
 #
 #   _persist_version is bumped when drink-counting logic changes materially.
 #   On startup, if the saved version < current version, stale drink
@@ -282,7 +289,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._data so sensors have values immediately on startup (before the
         first BLE sync).
         """
-        _PERSIST_VERSION = 3
+        _PERSIST_VERSION = 4
         saved_version = int(opts.get("_persist_version", 0))
 
         if saved_version < _PERSIST_VERSION:
@@ -923,6 +930,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         # Drink detected (>=30 mL threshold — HydrationRepo.m3820m)
                         if is_today:
                             self._daily_accumulated_drinks += 1
+                            self._daily_accumulated_ml += delta
                             self._daily_last_drink_ml = delta
                             self._daily_last_drink_ts = ts_iso
                         else:
@@ -1153,12 +1161,31 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 delta_cap, self._daily_accumulated_drinks, self._daily_water_remaining,
             )
 
+        had_log_data = self._water_level_from_log
         self._water_level_from_log = False  # reset for next poll
 
-        # â”€â”€ Compute totals â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # delta_cap + delta_manual = new consumption since last poll.
-        # accumulated_ml = sum of all deltas from previous polls today.
-        water_ml = self._daily_accumulated_ml + delta_cap + delta_manual
+        # Compute totals
+        # Two paths:
+        #   1. LOG-BASED (primary): _process_log_entries already added each
+        #      drink's mL into _daily_accumulated_ml.  Only add delta_manual.
+        #   2. CAP_ML-DELTA (fallback): when no log entries were available,
+        #      use delta_cap + delta_manual on top of accumulated_ml.
+        #
+        # This prevents the inflation bug caused by FIELD_CAP_ML being
+        # written by 3 different BLE responses (GET_CAP_STATE, GET_HYDRATIONS,
+        # GET_SYNC_INFO) with inconsistent reset semantics.
+        if had_log_data:
+            water_ml = self._daily_accumulated_ml + delta_manual
+            LOGGER.info(
+                "Totals (LOG-BASED): accumulated=%d + delta_manual=%d = %d",
+                self._daily_accumulated_ml, delta_manual, water_ml,
+            )
+        else:
+            water_ml = self._daily_accumulated_ml + delta_cap + delta_manual
+            LOGGER.info(
+                "Totals (CAP_ML fallback): accumulated=%d + delta_cap=%d + delta_manual=%d = %d",
+                self._daily_accumulated_ml, delta_cap, delta_manual, water_ml,
+            )
 
         # â”€â”€ Write all entities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         self._data[FIELD_WATER_ML]          = water_ml
@@ -1276,7 +1303,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         survives an HA restart within the same calendar day."""
         try:
             new_options = dict(self.config_entry.options)
-            new_options["_persist_version"]     = 3
+            new_options["_persist_version"]     = 4
             new_options["_baseline_cap_ml"]     = self._daily_baseline_cap_ml
             new_options["_baseline_manual"]     = self._daily_baseline_manual
             new_options["_accumulated_ml"]      = self._daily_accumulated_ml

@@ -344,9 +344,16 @@ def parse_notification(data: bytearray) -> dict[str, Any]:
                 result[FIELD_IS_CHARGING]      = bool(is_charging)
                 result[FIELD_BATTERY_CELL]     = data[13] & 0xFF
                 if pv == 12 and len(data) >= 16:
-                    daily_hydration = struct.unpack_from("<H", data, 14)[0]
-                    if 0 < daily_hydration < 0xFFFF:
-                        result[FIELD_CAP_ML] = daily_hydration
+                    # bytes[14..15] on pv<15 is the daily GOAL index/ml, NOT
+                    # daily hydration.  Do NOT assign to FIELD_CAP_ML — that
+                    # contaminates the delta-tracking with the goal value and
+                    # causes water_ml inflation.  GET_HYDRATIONS / GET_SYNC_INFO
+                    # provide the real consumption counters.
+                    _capstate_val = struct.unpack_from("<H", data, 14)[0]
+                    LOGGER.debug(
+                        "CapState pv=12 bytes[14..15]=%d (daily goal, NOT cap_ml)",
+                        _capstate_val,
+                    )
                 if pv >= 15 and len(data) >= 19:
                     measured = struct.unpack_from("<H", data, 17)[0]
                     if 0 < measured < 0xFFFF:
