@@ -135,13 +135,35 @@ _build_cmd = _make_cmd
 #   This ensures water_remaining always reflects the physical bottle state
 #   regardless of sync gap, while the "drinks today" counter stays accurate.
 #
+# ── CAP_ML COUNTER BEHAVIOR & DELTA ACCOUNTING ──────────────────────────
+#
+#   cap_ml is reported by GET_HYDRATIONS (0x72), GET_CAP_STATE (0x3C), and
+#   GET_SYNC_INFO (0x78).  Empirically, at least one of these reports a
+#   DAILY-CUMULATIVE value that keeps growing within the same day and is
+#   NOT reliably reset to 0 by CLEAR_LOGS.
+#
+#   _compute_daily_water() therefore uses DELTA accounting:
+#     delta_cap = cap_ml − _prev_cap_ml
+#     if delta_cap < 0 → genuine counter reset; treat delta_cap = cap_ml
+#   This handles both "cap_ml resets" and "cap_ml is cumulative" correctly
+#   and never double-counts regardless of CLEAR_LOGS behaviour.
+#
+#   _prev_cap_ml is persisted as "_baseline_cap_ml" in config entry options
+#   so HA restarts within the same day continue from the right position.
+#   On a new calendar day _prev_cap_ml is set to the current cap_ml value
+#   (baseline = whatever the device reports at midnight) so the first delta
+#   of the new day is 0 (safe start).
+#
 # ── PERSISTENCE & VERSION MIGRATION ───────────────────────────────────────
 #
 #   Daily hydration state is persisted into config_entry.options so it
 #   survives HA restarts within the same calendar day.  Keys:
-#     _baseline_cap_ml, _baseline_manual, _accumulated_ml,
-#     _accumulated_drinks, _last_drink_ml, _last_drink_ts,
-#     _water_remaining, _prev_cap_ml, _baseline_date, _persist_version
+#     _baseline_cap_ml  – last seen cap_ml (= _prev_cap_ml, for delta)
+#     _baseline_manual  – last seen manual_ml (for delta)
+#     _accumulated_ml   – running water total up to the last poll
+#     _accumulated_drinks, _last_drink_ml, _last_drink_ts
+#     _water_remaining, _prev_cap_ml, _baseline_date
+#     _persist_version  – currently 3
 #
 #   _persist_version is bumped when drink-counting logic changes materially.
 #   On startup, if the saved version < current version, stale drink
@@ -156,9 +178,10 @@ _build_cmd = _make_cmd
 #      ReadLogsCommand case 'l' → HydrationRepo.m3823q().  'L'/'U' entries
 #      only update water_remaining (prev_level) but never trigger a drink.
 #
-#   2. cap_ml (GET_HYDRATIONS 0x72) delta      ← FALLBACK only
+#   2. delta_cap (cap_ml − prev_cap_ml) fallback   ← FALLBACK only
 #      Used ONLY when _water_level_from_log is False (no 'l' log entries).
 #      Fires in _compute_daily_water() for housekeeping-only syncs.
+#      See "CAP_ML COUNTER BEHAVIOR" section above for delta formula.
 #
 #   'Ü' (0xDC HYDRATION_V2) is NOT used: the original SDK m3822p() is gated
 #   on a cloud-sync / premium flag (m3818k) that is never set in HA context.
@@ -1049,21 +1072,23 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         parsed = _parse_notification(raw)
         if parsed:
-            # Don't let intermediate notifications overwrite computed fields
-            # that _compute_daily_water manages (prevents 0% flicker).
-            # FIELD_LOG_COUNT is also excluded: a partial sync can receive the
-            # GET_LOG_LENGTH response (e.g. 104) and push it to coordinator.data
-            # via async_set_updated_data before the sync completes and clears it
-            # to 0 — resulting in a stale count showing in the UI after a failed
-            # sync.  Log count is only meaningful in the final polled result.
-            for key in (FIELD_HYDRATION_LEVEL, FIELD_WATER_ML,
-                        FIELD_DRINK_COUNT_TODAY, FIELD_LAST_DRINK_ML,
-                        FIELD_LAST_DRINK_TS, FIELD_WATER_REMAINING_ML,
-                        FIELD_DAILY_GOAL_ML, FIELD_LOG_COUNT):
-                parsed.pop(key, None)
+            # Always update self._data fully (including FIELD_LOG_COUNT) so
+            # _read_logs_async can see the log count from GET_LOG_LENGTH.
             self._data.update(parsed)
+            # For the intermediate HA push, exclude computed fields that
+            # _compute_daily_water manages (prevents 0% flicker) and
+            # FIELD_LOG_COUNT (prevents stale count showing in UI if a partial
+            # sync receives the count but then fails before CLEAR_LOGS resets it).
+            _SUPPRESS_INTERMEDIATE = frozenset((
+                FIELD_HYDRATION_LEVEL, FIELD_WATER_ML,
+                FIELD_DRINK_COUNT_TODAY, FIELD_LAST_DRINK_ML,
+                FIELD_LAST_DRINK_TS, FIELD_WATER_REMAINING_ML,
+                FIELD_DAILY_GOAL_ML, FIELD_LOG_COUNT,
+            ))
+            public = {k: v for k, v in self._data.items()
+                      if k not in _SUPPRESS_INTERMEDIATE}
             # Push update to HA without waiting for the next poll cycle
-            self.async_set_updated_data(dict(self._data))
+            self.async_set_updated_data(public)
 
     # ------------------------------------------------------------------
     # Internal BLE helpers
