@@ -1,4 +1,4 @@
-﻿"""Water.io BLE coordinator â€“ reverse-engineered from APK v3.5.0 / v4.8.6 (latest)."""
+"""Water.io BLE coordinator â€“ reverse-engineered from APK v3.5.0 / v4.8.6 (latest)."""
 from __future__ import annotations
 
 import asyncio
@@ -651,6 +651,14 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await asyncio.sleep(0.5)
             LOGGER.info("CLEAR_LOGS sent â€“ device log buffer cleared")
         self._data[FIELD_LOG_COUNT] = 0
+        # Reset the incremental-read watermark: CLEAR_LOGS just reset the
+        # device log counter to 0, so the next sync must read from offset 0.
+        # Without this reset: start_offset = min(old_watermark, new_count)
+        # which always equals new_count, so the skip-guard
+        # (start_offset >= log_count) fires and returns [] forever —
+        # every drink logged after a sync is silently discarded.
+        self._log_device_count = 0
+        LOGGER.debug("CLEAR_LOGS: watermark reset to 0")
 
         # Note: CMD_GET_SINGLE_MEAS (0x01) was tested but pv=12 firmware
         # ACKs without producing a measurement notification.
@@ -717,11 +725,27 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             LOGGER.debug("READ_LOGS: nothing new (device count=%d, last seen=%d)", log_count, start_offset)
             return []
 
+        # Hard wall-clock budget: stop reading before HA's setup watchdog fires.
+        # Partial progress is saved so the next sync continues from where we left off.
+        _BUDGET_S = 20.0
+        _deadline = asyncio.get_event_loop().time() + _BUDGET_S
+
         self._log_queue = asyncio.Queue()
         all_entries: list[dict] = []
+        budget_exhausted = False
         try:
             offset = start_offset
             while offset < log_count and len(all_entries) < _MAX_ENTRIES:
+                # Hard time budget — stop before HA's task-cancellation watchdog.
+                if asyncio.get_event_loop().time() >= _deadline:
+                    LOGGER.warning(
+                        "READ_LOGS: %.0fs budget exhausted at offset %d/%d — "
+                        "saving partial watermark, will resume next sync",
+                        _BUDGET_S, start_offset + len(all_entries), log_count,
+                    )
+                    budget_exhausted = True
+                    break
+
                 # Guard: BLE connection may have dropped mid-sync
                 if not self._client or not self._client.is_connected:
                     LOGGER.warning(
@@ -762,7 +786,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if entry_count < 16:
                         batch_done = True
 
-                offset = len(all_entries)
+                offset = start_offset + len(all_entries)
 
             from collections import Counter
             types = Counter(e["type"] for e in all_entries)
@@ -771,10 +795,20 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 len(all_entries), start_offset, start_offset + len(all_entries),
                 log_count, dict(types),
             )
-            # Advance watermark to the actual device count (not just offset+entries
-            # read, in case a batch request returned fewer entries than expected).
-            self._log_device_count = log_count
+            # Advance watermark: partial if budget was exhausted, full otherwise.
+            self._log_device_count = (
+                start_offset + len(all_entries) if budget_exhausted else log_count
+            )
             return all_entries
+        except asyncio.CancelledError:
+            # HA cancelled the task (e.g. setup watchdog). Save partial progress
+            # so the next sync resumes from here rather than starting from 0.
+            self._log_device_count = start_offset + len(all_entries)
+            LOGGER.warning(
+                "READ_LOGS: task cancelled at offset %d/%d — partial watermark saved",
+                self._log_device_count, log_count,
+            )
+            raise
         finally:
             self._log_queue = None
 
@@ -953,9 +987,14 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # distinguish persisted-yesterday count from today's log entries.
                 self._pre_fetch_drinks = self._daily_accumulated_drinks
                 await self._fetch_protocol_data()     # proprietary hydration + cap-state
+                # Set FIELD_LAST_SYNC BEFORE _compute_daily_water so that
+                # _persist_baseline (called at the end of _compute_daily_water)
+                # saves the current timestamp in _snap_last_sync.  Previously
+                # it was set after, so the persisted snap was always one sync
+                # behind and the sensor showed the old time after an HA restart.
+                self._data[FIELD_LAST_SYNC] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 self._compute_daily_water()           # cap-delta fallback (no-log path only)
 
-                self._data[FIELD_LAST_SYNC] = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 # Strip private accumulator fields (prefixed with '_') from the
                 # dict returned to the coordinator â€” they're internal state only.
                 public_data = {k: v for k, v in self._data.items() if not k.startswith("_")}
