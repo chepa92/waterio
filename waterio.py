@@ -184,10 +184,13 @@ async def discover() -> list[BLEDevice]:
 #      level=0 is valid (empty bottle) - original SDK has NO level<=0 guard.
 #      'L'/'U' entries only update prev_level/water_remaining, never drinks.
 #
-#   2. delta_cap (cap_ml - prev_cap_ml) fallback   <- HA-ONLY FALLBACK
-#      NOT in the original SDK.  Used ONLY when _water_level_from_log is
-#      False (no 'l' log entries in this sync - housekeeping-only polls).
-#      See "CAP_ML COUNTER" section above for the delta formula.
+#   2. delta_cap (cap_ml - prev_cap_ml) LAST-RESORT fallback
+#      NOT in the original SDK.  Used ONLY when _fetch_log_entries returned
+#      0 entries (log read failure).  If log entries were read (even
+#      housekeeping-only), the absence of 'l' entries is treated as
+#      authoritative: no drinks occurred.  See BUG FIX note in
+#      _compute_daily_water for details on the phantom accumulation bug
+#      that this guard prevents.
 #
 #   3. 'U+00DC' (0xDC HYDRATION_V2) via m3822p()  <- PARTIALLY USED BY SDK
 #      The original SDK DOES process 'U+00DC' entries (extraData * 5 = mL).
@@ -273,6 +276,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Runtime-only BLE + poll state
         self._log_queue: asyncio.Queue | None = None
         self._water_level_from_log: bool = False
+        self._had_any_log_entries: bool = False
         self._pre_fetch_drinks: int = 0
         self._ble_lock: asyncio.Lock = asyncio.Lock()
 
@@ -1005,6 +1009,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _read_logs_async(self) -> None:
         """Fetch log entries from device and process hydration events."""
         entries = await self._fetch_log_entries()
+        self._had_any_log_entries = len(entries) > 0
         await self._process_log_entries(entries)
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -1170,8 +1175,24 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # and set _water_level_from_log = True.  We trust that and skip the
         # cap_ml-delta heuristic to avoid double-counting.
         #
-        # When no log entries were available fall back to cap_ml deltas:
-        if not self._water_level_from_log and delta_cap > 5:
+        # When log entries WERE read (even housekeeping-only like CONNECTED,
+        # VOLTAGE, HYDRATION_STATE): the absence of 'l' entries is
+        # authoritative evidence that no drinking occurred.  The original
+        # Water.io SDK ONLY uses log entries for water tracking (never
+        # GET_SYNC_INFO), so we trust the log data exclusively.
+        #
+        # Cap_ml delta is a LAST-RESORT fallback: used ONLY when log reading
+        # failed completely (0 entries returned despite device reporting
+        # log_count > 0).  In all other cases, log-based data is definitive.
+        #
+        # BUG FIX: previously, any sync without 'l' entries (including normal
+        # housekeeping syncs) would trigger the cap_ml delta path.  GET_SYNC_INFO's
+        # cap_ml counter changes between syncs for non-drink reasons (measurement
+        # events, HYDRATION_STATE updates, etc.), causing phantom water
+        # accumulation of ~800mL per hourly sync cycle.
+        if (not self._water_level_from_log
+                and not self._had_any_log_entries
+                and delta_cap > 5):
             remaining_before = self._daily_water_remaining
 
             if delta_cap > remaining_before + 10:
@@ -1200,14 +1221,19 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
         had_log_data = self._water_level_from_log
+        had_any_logs = self._had_any_log_entries
         self._water_level_from_log = False  # reset for next poll
+        self._had_any_log_entries = False    # reset for next poll
 
         # Compute totals
-        # Two paths:
+        # Three paths:
         #   1. LOG-BASED (primary): _process_log_entries already added each
         #      drink's mL into _daily_accumulated_ml.  Only add delta_manual.
-        #   2. CAP_ML-DELTA (fallback): when no log entries were available,
-        #      use delta_cap + delta_manual on top of accumulated_ml.
+        #   2. LOGS-READ-NO-DRINKS: log entries were read but none were drink
+        #      events — authoritative evidence of no consumption.  Only manual.
+        #   3. CAP_ML-DELTA (last resort): when log reading FAILED (0 entries
+        #      despite device reporting log_count > 0), use delta_cap as a
+        #      rough estimate.  Unreliable but better than nothing.
         #
         # This prevents the inflation bug caused by FIELD_CAP_ML being
         # written by 3 different BLE responses (GET_CAP_STATE, GET_HYDRATIONS,
@@ -1217,6 +1243,16 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             LOGGER.info(
                 "Totals (LOG-BASED): accumulated=%d + delta_manual=%d = %d",
                 self._daily_accumulated_ml, delta_manual, water_ml,
+            )
+        elif had_any_logs:
+            # Log entries were read but no L/U/l/0xD0 entries found.
+            # This is normal for housekeeping syncs (CONNECTED, VOLTAGE, etc.).
+            # The absence of drink entries is definitive — do NOT use cap_ml delta.
+            water_ml = self._daily_accumulated_ml + delta_manual
+            LOGGER.info(
+                "Totals (LOGS-READ-NO-DRINKS): accumulated=%d + delta_manual=%d = %d  "
+                "(cap_ml delta %d suppressed — log had no drink events)",
+                self._daily_accumulated_ml, delta_manual, water_ml, delta_cap,
             )
         else:
             water_ml = self._daily_accumulated_ml + delta_cap + delta_manual
