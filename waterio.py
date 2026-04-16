@@ -457,7 +457,16 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Build a push dict WITHOUT suppressed fields - entities for those
             # get their final stable values from the coordinator return dict
             # at the end of the sync cycle (_async_update_data return).
+            #
+            # IMPORTANT: carry forward the PREVIOUS coordinator value for
+            # suppressed fields so they don't briefly become "unknown"
+            # (async_set_updated_data replaces self.data entirely).
             push = {k: v for k, v in self._data.items() if k not in _SUPPRESS_FROM_PUSH}
+            prev = self.data  # current coordinator public data (may be None on first poll)
+            if prev:
+                for k in _SUPPRESS_FROM_PUSH:
+                    if k in prev and k not in push:
+                        push[k] = prev[k]
             self.async_set_updated_data(push)
 
     # ------------------------------------------------------------------
