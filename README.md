@@ -36,7 +36,7 @@ git clone https://github.com/chepa/waterio waterio
 | Entity | Description |
 |---|---|
 | **Water Intake Today** | Daily cumulative mL consumed (cap sensor + log deltas). Resets at midnight. |
-| **Water Consumed (Total)** | Lifetime cumulative mL (`TOTAL_INCREASING`). Useful for HA Energy-style dashboards. |
+| **Water Consumed (Total)** | Running total of every drink the integration has counted (log drinks, including ones synced after midnight, plus manual entries). Never decreases (`TOTAL_INCREASING`), so HA statistics give correct per-day bars. |
 | **Manual Hydration Today** | mL logged manually via the Water.io app *(disabled by default)*. |
 | **Hydration Status Tier** | Raw tier: 0 = None, 1 = Low, 2 = Good, 3 = Excellent *(disabled by default)*. |
 | **Hydration Goal Progress** | % of daily goal achieved (0–100+). |

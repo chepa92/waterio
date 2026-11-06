@@ -30,7 +30,7 @@ from .const import (
     FIELD_DAILY_GOAL_ML, FIELD_EXTRA_GOAL_ML, FIELD_LAST_SYNC,
     FIELD_BATTERY_CELL, FIELD_DEVICE_CLOCK, FIELD_LOG_COUNT, FIELD_MAC_ADDRESS,
     FIELD_LAST_DRINK_ML, FIELD_LAST_DRINK_TS, FIELD_DRINK_COUNT_TODAY,
-    FIELD_WATER_REMAINING_ML, FIELD_JOURNAL_ENTRIES,
+    FIELD_WATER_REMAINING_ML, FIELD_JOURNAL_ENTRIES, FIELD_TOTAL_CONSUMED_ML,
 )
 from .waterio import WaterioCoordinator
 
@@ -58,7 +58,12 @@ SENSOR_DESCRIPTIONS: tuple[WaterioSensorDescription, ...] = (
     ),
     WaterioSensorDescription(
         key="cap_hydration_total",
-        field=FIELD_CAP_ML,
+        # Running sum kept by the integration (every log-detected drink,
+        # including late-synced ones from an earlier day, plus manual
+        # entries).  It never decreases.  The raw device cap_ml counter used
+        # before goes DOWN as well as up, which TOTAL_INCREASING treats as a
+        # meter reset - that inflated long-term statistics.
+        field=FIELD_TOTAL_CONSUMED_ML,
         name="Water Consumed (Total)",
         native_unit_of_measurement=UnitOfVolume.MILLILITERS,
         device_class=SensorDeviceClass.VOLUME,

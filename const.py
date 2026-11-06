@@ -223,6 +223,7 @@ FIELD_LED_OFF_CHARGER   = "led_off_in_charger"      # bool (type 52)
 FIELD_BOTTLE_VOLUME     = "bottle_volume_type"      # uint8: 0=500mL,1=750mL (type 53)
 FIELD_REMINDER_COLOR    = "reminder_color_rgb"      # str: "#RRGGBB" LED color (type 30)
 FIELD_JOURNAL_ENTRIES   = "journal_entry_count"     # int: total log entries stored in journal
+FIELD_TOTAL_CONSUMED_ML = "total_consumed_ml"       # int: running sum of every drink (log + manual), never decreases
 
 # -------------------------------------------------------------------
 # TypeConfig registry

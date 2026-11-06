@@ -49,7 +49,7 @@ from .const import (
     FIELD_CAP_CLOSED, FIELD_IS_CHARGING,
     FIELD_IS_ACTIVE, FIELD_NEED_DRINK, FIELD_SILENT_MODE,
     FIELD_BATTERY_CELL, FIELD_MAC_ADDRESS, FIELD_DEVICE_CLOCK,
-    FIELD_LOG_COUNT,
+    FIELD_LOG_COUNT, FIELD_TOTAL_CONSUMED_ML,
     FIELD_LAST_DRINK_ML, FIELD_LAST_DRINK_TS, FIELD_DRINK_COUNT_TODAY,
     FIELD_WATER_REMAINING_ML,
     FIELD_HYDRATION_LEVEL, FIELD_REMINDER_COLOR,
@@ -184,13 +184,10 @@ async def discover() -> list[BLEDevice]:
 #      level=0 is valid (empty bottle) - original SDK has NO level<=0 guard.
 #      'L'/'U' entries only update prev_level/water_remaining, never drinks.
 #
-#   2. delta_cap (cap_ml - prev_cap_ml) LAST-RESORT fallback
-#      NOT in the original SDK.  Used ONLY when _fetch_log_entries returned
-#      0 entries (log read failure).  If log entries were read (even
-#      housekeeping-only), the absence of 'l' entries is treated as
-#      authoritative: no drinks occurred.  See BUG FIX note in
-#      _compute_daily_water for details on the phantom accumulation bug
-#      that this guard prevents.
+#   2. delta_cap (cap_ml - prev_cap_ml) - REMOVED as a drink source.
+#      It used to estimate a drink when the log could not be read.  Unread
+#      log entries are now kept on the device and read next sync, so the
+#      estimate double-counted.  cap_ml is only logged for diagnostics.
 #
 #   3. 'U+00DC' (0xDC HYDRATION_V2) via m3822p()  <- PARTIALLY USED BY SDK
 #      The original SDK DOES process 'U+00DC' entries (extraData * 5 = mL).
@@ -278,11 +275,13 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._water_level_from_log: bool = False
         # True when the device log was read successfully this poll (log
         # length known and every entry fetched), even if it held 0 entries.
-        # Only when this is False is the cap_ml-delta fallback allowed.
+        # (diagnostic only - drinks come exclusively from the log)
         self._had_any_log_entries: bool = False
         # True when every log entry up to the device's log_count was fetched;
         # CLEAR_LOGS is only sent in that case so unread drinks are never wiped.
         self._log_read_complete: bool = False
+        # Notifications received during the current sync (0 = bottle silent).
+        self._notif_count: int = 0
         # Set when the day rolled over; cap/manual baselines are re-taken on
         # the next _compute_daily_water (needs this poll's cap_ml).
         self._cap_baseline_pending: bool = False
@@ -353,6 +352,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._daily_water_remaining     = int(opts.get("_water_remaining", 0))
             self._prev_cap_ml               = int(opts.get("_prev_cap_ml", self._daily_baseline_cap_ml))
 
+        # Running total for "Water Consumed (Total)" - independent of the day
+        # and never reset by the persistence-version migration above.
+        self._total_consumed_ml = int(opts.get("_total_consumed_ml", 0))
+        self._data[FIELD_TOTAL_CONSUMED_ML] = self._total_consumed_ml
+
         saved_date_str: str | None = opts.get("_baseline_date")
         try:
             from datetime import date as _date
@@ -393,17 +397,12 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if _v is not None:
                 self._data[_f] = _v
 
-        # Pre-populate journal entry count from the existing journal file.
-        try:
-            _jp = self._journal_path
-            if os.path.exists(_jp):
-                with open(_jp, "r", encoding="utf-8") as _jf:
-                    _j = json.load(_jf)
-                self._data[FIELD_JOURNAL_ENTRIES] = sum(s.get("log_count", 0) for s in _j)
-            else:
-                self._data[FIELD_JOURNAL_ENTRIES] = 0
-        except Exception:
-            self._data[FIELD_JOURNAL_ENTRIES] = 0
+        # Journal entry count: restored from options.  If it was never
+        # persisted (upgrade), async_init_journal_count() counts the files in
+        # the executor - opening a multi-MB file here would block the loop.
+        _jc = opts.get("_journal_entries")
+        self._journal_count: int | None = int(_jc) if _jc is not None else None
+        self._data[FIELD_JOURNAL_ENTRIES] = self._journal_count or 0
 
         # Restore incremental log-read watermark: number of entries that were
         # on the device at the end of the last successful sync.  Next sync
@@ -415,6 +414,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _on_notification(self, _sender: int, raw: bytearray) -> None:
         """Handle incoming notifications from the cap."""
+        self._notif_count += 1
         # READ_LOGS (0x0E) responses: during an active log-reading session they
         # go to the dedicated streaming queue.  Outside a session, update
         # water_remaining_ml in real-time from any L/U measurement push.
@@ -534,10 +534,21 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False
 
         await asyncio.sleep(0.5)          # give stack time to settle
-        await self._discover_chars()
+        if not await self._discover_chars():
+            # Without a working write char + notify subscription no command
+            # gets an answer.  Previously the sync carried on anyway: every
+            # command failed with "Not connected", yet the sync was reported
+            # as successful (last_sync updated, daily totals recomputed from
+            # stale data).  Treat it as unreachable instead.
+            LOGGER.warning(
+                "BLE link to %s unusable (write=%s notify_ok=False) - aborting sync",
+                self._mac, self._write_char,
+            )
+            await self.disconnect()
+            return False
         return True
 
-    async def _discover_chars(self) -> None:
+    async def _discover_chars(self) -> bool:
         """
         Walk GATT services, find the best write + notify characteristics
         from the proprietary UUIDs discovered during APK reverse engineering.
@@ -547,7 +558,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         when testing against real hardware.
         """
         if not self._client:
-            return
+            return False
 
         self._notify_char = None
         self._write_char  = None
@@ -583,8 +594,10 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Extra settle time: HA bluetooth proxy needs longer than direct BleakClient
                 # before the device starts routing notification callbacks reliably.
                 await asyncio.sleep(0.8)
-            except BleakError as exc:
+            except Exception as exc:  # BleakError, GATT protocol errors, proxy errors
                 LOGGER.warning("start_notify failed for %s: %s", self._notify_char, exc)
+                return False
+            return self._write_char is not None and self._client.is_connected
         else:
             # Diagnostic fallback: subscribe to everything that supports notify.
             # Errors are logged so we can see which chars the device rejects.
@@ -601,6 +614,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             LOGGER.warning("Diagnostic subscribe OK:   %s", ch.uuid)
                         except Exception as exc:
                             LOGGER.warning("Diagnostic subscribe FAIL: %s  %s", ch.uuid, exc)
+            # Known notify char missing: the protocol cannot work this sync.
+            return False
 
     async def _read_standard_gatt(self) -> None:
         """Read Bluetooth SIG standardised characteristics."""
@@ -761,7 +776,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Note: CMD_GET_SINGLE_MEAS (0x01) was tested but pv=12 firmware
         # ACKs without producing a measurement notification.
         # Water remaining comes from L/U/l log entries (firmware-converted mL).
-        # If no log entries are available, cap_ml delta heuristic is the fallback.
+        # If the log could not be read, nothing is counted; entries are kept.
 
     async def _write_cmd_v4(self, opcode: int, payload: bytes = b"") -> bool:
         """Write a v4.8.6 format command: [opcode, 0x00, 0x00, len, payload...]
@@ -1033,6 +1048,9 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     delta = prev_level - level
                     if delta >= 30 and ev in _DRINK_OPCODES:
                         # Drink detected (>=30 mL threshold — HydrationRepo.m3820m)
+                        # Every drink goes into the running total, including
+                        # ones from an earlier day that synced late.
+                        self._add_to_total(delta)
                         if is_today:
                             self._daily_accumulated_drinks += 1
                             self._daily_accumulated_ml += delta
@@ -1057,7 +1075,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if past_drinks_total:
             LOGGER.info(
-                "Retro-sync: %d past-day drinks totalling %dmL (not added to today)",
+                "Retro-sync: %d past-day drinks totalling %dmL (not added to today; "
+            "added to Water Consumed (Total))",
                 past_drinks_total, past_ml_total,
             )
 
@@ -1074,7 +1093,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         entries = await self._fetch_log_entries()
         # A successful read of an empty/unchanged log is authoritative "no
         # drinks", same as a housekeeping-only log.  Previously 0 entries
-        # always fell through to the cap_ml-delta fallback (phantom drinks).
+        # fell through to the (now removed) cap_ml-delta fallback.
         self._had_any_log_entries = len(entries) > 0 or self._log_read_complete
         await self._process_log_entries(entries)
 
@@ -1099,16 +1118,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if self._rollover_daily_counters():
                     self._publish_daily_fields(self._daily_accumulated_ml)
                     self._persist_baseline()
-                if self._data.get(FIELD_LAST_SYNC):
-                    LOGGER.info(
-                        "BLE connect failed â€“ returning last known data  "
-                        "last_sync=%s", self._data.get(FIELD_LAST_SYNC),
-                    )
-                    public = {k: v for k, v in self._data.items()
-                              if not k.startswith("_")}
-                    public["ble_reachable"] = False
-                    return public
-                raise UpdateFailed(f"Cannot connect to Water.io cap {self._mac}")
+                return self._unreachable_result()
 
             try:
                 # Mark BLE reachable immediately so every mid-sync
@@ -1122,14 +1132,36 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # accumulators (both count AND mL) instead of being added on
                 # top of yesterday's totals and then wiped by the reset.
                 self._rollover_daily_counters()
+                self._notif_count = 0
                 await self._fetch_protocol_data()     # proprietary hydration + cap-state
+                if self._notif_count == 0:
+                    LOGGER.warning(
+                        "No responses from %s during sync - treating as unreachable",
+                        self._mac,
+                    )
+                    self._publish_daily_fields(self._daily_accumulated_ml)
+                    return self._unreachable_result()
+                if not (self._client and self._client.is_connected):
+                    # Link died during the sync: the commands got no answers,
+                    # so the data is stale.  Do NOT mark the sync successful,
+                    # recompute or persist.  Drinks already processed from a
+                    # partial log read stay in memory together with the
+                    # advanced watermark (consistent); unread entries remain
+                    # on the device because CLEAR_LOGS was not applied.
+                    LOGGER.warning(
+                        "BLE link to %s lost during sync - keeping last known data",
+                        self._mac,
+                    )
+                    # Show drinks from any partial log read / a day rollover.
+                    self._publish_daily_fields(self._daily_accumulated_ml)
+                    return self._unreachable_result()
                 # Set FIELD_LAST_SYNC BEFORE _compute_daily_water so that
                 # _persist_baseline (called at the end of _compute_daily_water)
                 # saves the current timestamp in _snap_last_sync.  Previously
                 # it was set after, so the persisted snap was always one sync
                 # behind and the sensor showed the old time after an HA restart.
                 self._data[FIELD_LAST_SYNC] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-                self._compute_daily_water()           # cap-delta fallback (no-log path only)
+                self._compute_daily_water()           # daily totals from log-based accumulators
 
                 # Strip private accumulator fields (prefixed with '_') from the
                 # dict returned to the coordinator â€” they're internal state only.
@@ -1142,6 +1174,24 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # open between polls.  Saves bottle battery and avoids Android app
                 # being locked out of its own device.
                 await self.disconnect()
+
+    def _unreachable_result(self) -> dict[str, Any]:
+        """Return last known data (sensors stay available until stale)."""
+        self._data["ble_reachable"] = False
+        if self._data.get(FIELD_LAST_SYNC):
+            LOGGER.info(
+                "Water.io unreachable - returning last known data  last_sync=%s",
+                self._data.get(FIELD_LAST_SYNC),
+            )
+            public = {k: v for k, v in self._data.items() if not k.startswith("_")}
+            public["ble_reachable"] = False
+            return public
+        raise UpdateFailed(f"Cannot connect to Water.io cap {self._mac}")
+
+    def _add_to_total(self, ml: int) -> None:
+        """Add consumed mL to the never-decreasing running total."""
+        self._total_consumed_ml += int(ml)
+        self._data[FIELD_TOTAL_CONSUMED_ML] = self._total_consumed_ml
 
     @property
     def daily_date(self):
@@ -1292,98 +1342,33 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._daily_accumulated_ml,
         )
 
-        # â”€â”€ Drink / refill detection (cap_ml delta, fallback only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        # When the log gave us real L/U/Ã entries: _read_logs_async already
-        # processed every drink and refill event in order, updated
-        # _daily_accumulated_drinks / _daily_last_drink_* / _daily_water_remaining,
-        # and set _water_level_from_log = True.  We trust that and skip the
-        # cap_ml-delta heuristic to avoid double-counting.
+        # -- Totals (log-based only) -------------------------------------------
+        # Drinks come ONLY from the device log ('l' entries), exactly like the
+        # original Water.io SDK.  _process_log_entries has already added each
+        # drink's mL to _daily_accumulated_ml; here we only add manual entries.
         #
-        # When log entries WERE read (even housekeeping-only like CONNECTED,
-        # VOLTAGE, HYDRATION_STATE): the absence of 'l' entries is
-        # authoritative evidence that no drinking occurred.  The original
-        # Water.io SDK ONLY uses log entries for water tracking (never
-        # GET_SYNC_INFO), so we trust the log data exclusively.
-        #
-        # Cap_ml delta is a LAST-RESORT fallback: used ONLY when log reading
-        # failed completely (0 entries returned despite device reporting
-        # log_count > 0).  In all other cases, log-based data is definitive.
-        #
-        # BUG FIX: previously, any sync without 'l' entries (including normal
-        # housekeeping syncs) would trigger the cap_ml delta path.  GET_SYNC_INFO's
-        # cap_ml counter changes between syncs for non-drink reasons (measurement
-        # events, HYDRATION_STATE updates, etc.), causing phantom water
-        # accumulation of ~800mL per hourly sync cycle.
-        if (not self._water_level_from_log
-                and not self._had_any_log_entries
-                and delta_cap > 5):
-            remaining_before = self._daily_water_remaining
-
-            if delta_cap > remaining_before + 10:
-                # Consumed more than what was in the bottle â†’ refill(s) happened.
-                available = remaining_before
-                n_refills = 0
-                while available < delta_cap:
-                    available += bottle_cap
-                    n_refills += 1
-                new_remaining = available - delta_cap
-                LOGGER.info(
-                    "Refill detected (cap_ml): consumed %dmL > remaining %dmL â†’ "
-                    "%d refill(s)  new_remaining=%dmL",
-                    delta_cap, remaining_before, n_refills, new_remaining,
-                )
-                self._daily_water_remaining = max(0, new_remaining)
-            else:
-                self._daily_water_remaining = max(0, remaining_before - delta_cap)
-
-            self._daily_accumulated_drinks += 1
-            self._daily_last_drink_ml = delta_cap
-            self._daily_last_drink_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        # There is deliberately NO cap_ml-delta fallback any more.  It used to
+        # estimate a drink when the log could not be read.  Since unread log
+        # entries are now kept on the device (CLEAR_LOGS is skipped), the next
+        # sync reads the real 'l' entries - so an estimate here would count the
+        # same water twice.  If the log was not read, nothing is added now and
+        # the drinks arrive with the next successful read.
+        if not self._log_read_complete and not self._water_level_from_log:
             LOGGER.info(
-                "New drink detected (cap_ml fallback): +%dmL  drink #%d today  remaining=%dmL",
-                delta_cap, self._daily_accumulated_drinks, self._daily_water_remaining,
+                "Log not read this sync - no drinks counted now (cap_ml delta %d "
+                "ignored); unread entries stay on the device for the next sync",
+                delta_cap,
             )
-
-        had_log_data = self._water_level_from_log
-        had_any_logs = self._had_any_log_entries
         self._water_level_from_log = False  # reset for next poll
         self._had_any_log_entries = False    # reset for next poll
 
-        # Compute totals
-        # Three paths:
-        #   1. LOG-BASED (primary): _process_log_entries already added each
-        #      drink's mL into _daily_accumulated_ml.  Only add delta_manual.
-        #   2. LOGS-READ-NO-DRINKS: log entries were read but none were drink
-        #      events — authoritative evidence of no consumption.  Only manual.
-        #   3. CAP_ML-DELTA (last resort): when log reading FAILED (0 entries
-        #      despite device reporting log_count > 0), use delta_cap as a
-        #      rough estimate.  Unreliable but better than nothing.
-        #
-        # This prevents the inflation bug caused by FIELD_CAP_ML being
-        # written by 3 different BLE responses (GET_CAP_STATE, GET_HYDRATIONS,
-        # GET_SYNC_INFO) with inconsistent reset semantics.
-        if had_log_data:
-            water_ml = self._daily_accumulated_ml + delta_manual
-            LOGGER.info(
-                "Totals (LOG-BASED): accumulated=%d + delta_manual=%d = %d",
-                self._daily_accumulated_ml, delta_manual, water_ml,
-            )
-        elif had_any_logs:
-            # Log entries were read but no L/U/l/0xD0 entries found.
-            # This is normal for housekeeping syncs (CONNECTED, VOLTAGE, etc.).
-            # The absence of drink entries is definitive — do NOT use cap_ml delta.
-            water_ml = self._daily_accumulated_ml + delta_manual
-            LOGGER.info(
-                "Totals (LOGS-READ-NO-DRINKS): accumulated=%d + delta_manual=%d = %d  "
-                "(cap_ml delta %d suppressed — log had no drink events)",
-                self._daily_accumulated_ml, delta_manual, water_ml, delta_cap,
-            )
-        else:
-            water_ml = self._daily_accumulated_ml + delta_cap + delta_manual
-            LOGGER.info(
-                "Totals (CAP_ML fallback): accumulated=%d + delta_cap=%d + delta_manual=%d = %d",
-                self._daily_accumulated_ml, delta_cap, delta_manual, water_ml,
-            )
+        water_ml = self._daily_accumulated_ml + delta_manual
+        if delta_manual > 0:
+            self._add_to_total(delta_manual)
+        LOGGER.info(
+            "Totals: accumulated=%d + delta_manual=%d = %d",
+            self._daily_accumulated_ml, delta_manual, water_ml,
+        )
 
         # -- Write all entities ------------------------------------------------
         self._publish_daily_fields(water_ml)
@@ -1409,31 +1394,73 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Persist after every poll so HA restart recovers everything
         self._persist_baseline()
 
+    # Journal: JSON-lines, one sync session per line, appended (never rewritten).
+    # Rotated to <name>.1 when it exceeds _JOURNAL_MAX_BYTES.  The legacy
+    # waterio_journal_<MAC>.json (one big JSON array, rewritten on every sync)
+    # is left untouched and no longer written.
+    _JOURNAL_MAX_BYTES = 5 * 1024 * 1024
+
+    @property
+    def _journal_base(self) -> str:
+        mac_clean = self._mac.replace(":", "").upper()
+        return self.hass.config.path(f"waterio_journal_{mac_clean}")
+
     @property
     def _journal_path(self) -> str:
-        """Absolute path to the per-device journal JSON file."""
-        mac_clean = self._mac.replace(":", "").upper()
-        return self.hass.config.path(f"waterio_journal_{mac_clean}.json")
+        """Absolute path to the per-device journal (JSON lines)."""
+        return self._journal_base + ".jsonl"
 
-    def _journal_write_blocking(self, session: dict, path: str) -> int:
-        """Blocking file I/O â€” must be called via run_in_executor only."""
-        if os.path.exists(path):
+    def _journal_count_blocking(self) -> int:
+        """Count entries in all journal files - executor only."""
+        total = 0
+        legacy = self._journal_base + ".json"
+        if os.path.exists(legacy):
+            try:
+                with open(legacy, "r", encoding="utf-8") as f:
+                    total += sum(s.get("log_count", 0) for s in json.load(f))
+            except Exception:
+                pass
+        for path in (self._journal_path + ".1", self._journal_path):
+            if not os.path.exists(path):
+                continue
             with open(path, "r", encoding="utf-8") as f:
-                journal: list = json.load(f)
-        else:
-            journal = []
-        journal.append(session)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(journal, f, ensure_ascii=False, indent=2)
-        return sum(s.get("log_count", 0) for s in journal)
+                for line in f:
+                    try:
+                        total += json.loads(line).get("log_count", 0)
+                    except ValueError:
+                        pass
+        return total
+
+    async def async_init_journal_count(self) -> None:
+        """Count journal entries once (off the event loop) if not persisted."""
+        if self._journal_count is not None:
+            return
+        try:
+            self._journal_count = await self.hass.async_add_executor_job(
+                self._journal_count_blocking
+            )
+        except Exception as exc:
+            LOGGER.warning("Journal count failed: %s", exc)
+            self._journal_count = 0
+        self._data[FIELD_JOURNAL_ENTRIES] = self._journal_count
+
+    def _journal_write_blocking(self, session: dict, path: str) -> None:
+        """Append one session line; rotate when too big - executor only."""
+        try:
+            if os.path.getsize(path) > self._JOURNAL_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except FileNotFoundError:
+            pass
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(session, ensure_ascii=False, separators=(",", ":")))
+            f.write("\n")
 
     async def _save_journal(self, all_entries: list[dict]) -> None:
-        """Append this sync session's raw log entries to the journal JSON file.
+        """Append this sync session's raw log entries to the journal.
 
-        File lives at <HA config>/waterio_journal_<MAC>.json.
-        Structure: list of session objects, newest appended last.
-        Each session: { sync_ts, device_mac, log_count, entries[] }.
-        Each entry:   { ts, ts_iso, type, type_name, level, extra, raw }.
+        File: <HA config>/waterio_journal_<MAC>.jsonl - one JSON object per
+        line: { sync_ts, device_mac, log_count, entries[] }.
+        Each entry: { ts, ts_iso, type, type_name, level, extra, raw }.
         """
         if not all_entries:
             return
@@ -1462,28 +1489,33 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         path = self._journal_path
         try:
-            total = await self.hass.async_add_executor_job(
+            await self.hass.async_add_executor_job(
                 self._journal_write_blocking, session, path
             )
-            self._data[FIELD_JOURNAL_ENTRIES] = total
+            self._journal_count = (self._journal_count or 0) + len(all_entries)
+            self._data[FIELD_JOURNAL_ENTRIES] = self._journal_count
             LOGGER.info(
                 "Journal: +%d entries saved  total=%d  path=%s",
-                len(all_entries), total, path,
+                len(all_entries), self._journal_count, path,
             )
         except Exception as exc:
             LOGGER.warning("Journal save failed: %s", exc)
 
     async def async_clear_journal(self) -> None:
-        """Delete the journal file (called by the Clear Journal button)."""
-        path = self._journal_path
-        try:
-            await self.hass.async_add_executor_job(os.remove, path)
-            LOGGER.info("Journal cleared: %s", path)
-        except FileNotFoundError:
-            pass
-        except Exception as exc:
-            LOGGER.warning("Journal clear failed: %s", exc)
+        """Delete all journal files (called by the Clear Journal button)."""
+        for path in (
+            self._journal_path, self._journal_path + ".1", self._journal_base + ".json",
+        ):
+            try:
+                await self.hass.async_add_executor_job(os.remove, path)
+                LOGGER.info("Journal cleared: %s", path)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                LOGGER.warning("Journal clear failed: %s  %s", path, exc)
+        self._journal_count = 0
         self._data[FIELD_JOURNAL_ENTRIES] = 0
+        self._persist_baseline()
         self.async_set_updated_data(dict(self._data))
 
     def _persist_baseline(self) -> None:
@@ -1502,6 +1534,9 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             new_options["_prev_cap_ml"]         = self._prev_cap_ml
             new_options["_baseline_date"]       = self._daily_today_date.isoformat() if self._daily_today_date else ""
             new_options["_log_device_count"]     = self._log_device_count
+            new_options["_total_consumed_ml"]    = self._total_consumed_ml
+            if self._journal_count is not None:
+                new_options["_journal_entries"]  = self._journal_count
             # Snapshot BLE-read-only fields so they survive HA restarts
             for _f in SNAP_FIELDS:
                 _v = self._data.get(_f)
