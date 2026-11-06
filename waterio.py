@@ -285,7 +285,9 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Set when the day rolled over; cap/manual baselines are re-taken on
         # the next _compute_daily_water (needs this poll's cap_ml).
         self._cap_baseline_pending: bool = False
-        self._first_boot_pending: bool = False
+        # True once a real water level has been seen (log 'l'/'L'/'U'/0xD0
+        # entry).  Restored in _restore_state.
+        self._level_known: bool = False
         self._ble_lock: asyncio.Lock = asyncio.Lock()
 
         # Restore persisted daily hydration state + last-known sensor values
@@ -364,11 +366,10 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except (ValueError, TypeError):
             self._daily_today_date = None
 
-        # Initialize water_remaining to bottle capacity if not yet set
-        # (first boot or migration from older version without remaining tracking).
-        if "_water_remaining" not in opts and self._daily_today_date is not None:
-            _bv = int(self._settings.get(FIELD_BOTTLE_VOLUME, 0))
-            self._daily_water_remaining = BOTTLE_VOLUME_ML.get(_bv, 500)
+        # Is the bottle level a real reading?  Never invent one (assuming a
+        # full bottle made the first real 'l' entry count as a phantom drink).
+        # Installs from before this flag existed: known iff a level was saved.
+        self._level_known = bool(opts.get("_level_known", "_water_remaining" in opts))
 
         # HA restarted on a later day than the persisted one: start today's
         # counters from zero right away instead of showing yesterday's totals
@@ -384,7 +385,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._data[FIELD_DRINK_COUNT_TODAY]   = self._daily_accumulated_drinks
             self._data[FIELD_LAST_DRINK_ML]       = self._daily_last_drink_ml
             self._data[FIELD_LAST_DRINK_TS]       = self._daily_last_drink_ts or None
-            self._data[FIELD_WATER_REMAINING_ML]  = self._daily_water_remaining
+            self._data[FIELD_WATER_REMAINING_ML]  = self._remaining_for_display()
             self._data[FIELD_HYDRATION_LEVEL]     = min(
                 100, round(self._daily_accumulated_ml / _goal_ml * 100)
             )
@@ -1002,8 +1003,9 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         # Seed prev_level from persisted water_remaining so the first log
         # entry can detect a drink/refill relative to the last sync.
+        # 0 is a valid known level (empty bottle); unknown -> no seed.
         prev_level: int | None = (
-            self._daily_water_remaining if self._daily_water_remaining > 0 else None
+            self._daily_water_remaining if self._level_known else None
         )
         last_level: int | None = None
         # Sanity threshold: levels beyond 2× bottle capacity are raw ADC values
@@ -1041,6 +1043,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     subtype_name, level, ts_iso,
                 )
                 prev_level = level
+                self._level_known = True
             else:
                 # L/U/l — all carry mL from firmware; update water level.
                 # Only 'l' entries count as drinks (matches original SDK).
@@ -1082,6 +1085,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if last_level is not None and 0 <= last_level <= bottle_cap * 4:
             self._daily_water_remaining = last_level
+            self._level_known = True
             self._data[FIELD_WATER_REMAINING_ML] = last_level
             self._water_level_from_log = True
             LOGGER.info(
@@ -1188,6 +1192,10 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return public
         raise UpdateFailed(f"Cannot connect to Water.io cap {self._mac}")
 
+    def _remaining_for_display(self) -> int | None:
+        """Water remaining, or None (sensor shows Unknown) if never measured."""
+        return self._daily_water_remaining if self._level_known else None
+
     def _add_to_total(self, ml: int) -> None:
         """Add consumed mL to the never-decreasing running total."""
         self._total_consumed_ml += int(ml)
@@ -1204,7 +1212,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._data[FIELD_DRINK_COUNT_TODAY]  = self._daily_accumulated_drinks
         self._data[FIELD_LAST_DRINK_ML]      = self._daily_last_drink_ml
         self._data[FIELD_LAST_DRINK_TS]      = self._daily_last_drink_ts or None
-        self._data[FIELD_WATER_REMAINING_ML] = self._daily_water_remaining
+        self._data[FIELD_WATER_REMAINING_ML] = self._remaining_for_display()
         # Override device-reported hydration_level with our own computation.
         # The device byte[7] resets to 0 after CLEAR_LOGS / counter resets,
         # but our water_ml tracks the real daily total.
@@ -1234,8 +1242,6 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             today, self._daily_today_date,
             self._daily_accumulated_drinks, self._daily_accumulated_ml,
         )
-        if self._daily_today_date is None:
-            self._first_boot_pending   = True
         self._daily_today_date         = today
         self._daily_accumulated_ml     = 0
         self._daily_accumulated_drinks = 0
@@ -1304,12 +1310,6 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._daily_baseline_cap_ml     = cap_ml
             self._daily_baseline_manual     = manual_ml
             self._prev_cap_ml               = cap_ml   # baseline for delta
-            # First boot ever: assume a full bottle.  Otherwise keep the
-            # physical level from yesterday (0 = genuinely empty bottle).
-            if self._first_boot_pending:
-                self._first_boot_pending = False
-                if self._daily_water_remaining <= 0:
-                    self._daily_water_remaining = bottle_cap
             # Fall through - compute totals correctly below instead of returning early
 
         # â”€â”€ Delta-based accounting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1531,6 +1531,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             new_options["_last_drink_ml"]       = self._daily_last_drink_ml
             new_options["_last_drink_ts"]       = self._daily_last_drink_ts
             new_options["_water_remaining"]     = self._daily_water_remaining
+            new_options["_level_known"]         = self._level_known
             new_options["_prev_cap_ml"]         = self._prev_cap_ml
             new_options["_baseline_date"]       = self._daily_today_date.isoformat() if self._daily_today_date else ""
             new_options["_log_device_count"]     = self._log_device_count
