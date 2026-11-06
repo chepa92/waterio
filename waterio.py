@@ -277,7 +277,9 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._log_queue: asyncio.Queue | None = None
         self._water_level_from_log: bool = False
         self._had_any_log_entries: bool = False
-        self._pre_fetch_drinks: int = 0
+        # Set when the day rolled over; cap/manual baselines are re-taken on
+        # the next _compute_daily_water (needs this poll's cap_ml).
+        self._cap_baseline_pending: bool = False
         self._ble_lock: asyncio.Lock = asyncio.Lock()
 
         # Restore persisted daily hydration state + last-known sensor values
@@ -1055,9 +1057,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # "unavailable" on every intermediate notification during the sync.
                 self._data["ble_reachable"] = True
                 await self._read_standard_gatt()      # battery, firmware, manufacturer â€¦
-                # Snapshot drink counter BEFORE log reading so new-day reset can
-                # distinguish persisted-yesterday count from today's log entries.
-                self._pre_fetch_drinks = self._daily_accumulated_drinks
+                # Roll the daily counters over to the new day BEFORE reading
+                # logs, so drinks from today's log entries land in fresh
+                # accumulators (both count AND mL) instead of being added on
+                # top of yesterday's totals and then wiped by the reset.
+                self._rollover_daily_counters()
                 await self._fetch_protocol_data()     # proprietary hydration + cap-state
                 # Set FIELD_LAST_SYNC BEFORE _compute_daily_water so that
                 # _persist_baseline (called at the end of _compute_daily_water)
@@ -1078,6 +1082,37 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # open between polls.  Saves bottle battery and avoids Android app
                 # being locked out of its own device.
                 await self.disconnect()
+
+    def _rollover_daily_counters(self) -> bool:
+        """Reset the per-day drink/mL accumulators when the calendar day changed.
+
+        Must run BEFORE log entries are processed: _process_log_entries adds
+        today's drinks (count and mL) straight into the accumulators, so a
+        reset afterwards would wipe them.  Previously the reset ran after log
+        processing and only tried to preserve the drink COUNT via a snapshot,
+        which zeroed today's mL (drinks=N but water=0mL) whenever the first
+        sync of the day carried drinks.
+
+        Cap/manual counter baselines need this poll's values, so they are
+        re-taken later in _compute_daily_water (via _cap_baseline_pending).
+        Returns True if a rollover happened.
+        """
+        today = dt_util.now().date()
+        if self._daily_today_date == today:
+            return False
+        LOGGER.info(
+            "New day %s (was %s) - resetting daily counters  "
+            "previous: drinks=%d  water=%dmL",
+            today, self._daily_today_date,
+            self._daily_accumulated_drinks, self._daily_accumulated_ml,
+        )
+        self._daily_today_date         = today
+        self._daily_accumulated_ml     = 0
+        self._daily_accumulated_drinks = 0
+        self._daily_last_drink_ml      = 0
+        self._daily_last_drink_ts      = ""
+        self._cap_baseline_pending     = True
+        return True
 
     def _compute_daily_water(self) -> None:
         """Single source of truth for ALL daily hydration entities.
@@ -1118,34 +1153,31 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._data.get("bottle_volume_type", 0), 500
         )
 
-        # â”€â”€ New calendar day â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        if self._daily_today_date != today:
-            # _read_logs_async already ran this poll and may have added today's
-            # drinks into the accumulators on top of yesterday's persisted count.
-            # Isolate today's log contribution using the pre-fetch snapshot.
-            # _daily_accumulated_drinks may include yesterday's persisted count +
-            # today's drinks just added by _read_logs_async.  Subtract the
-            # snapshot to get only what log processing added for today.
-            today_drinks = max(0, self._daily_accumulated_drinks - self._pre_fetch_drinks)
+        # -- New calendar day --------------------------------------------------
+        # The drink/ml counters were normally already rolled over by
+        # _rollover_daily_counters() BEFORE the logs were read (see
+        # _async_update_data), so today's log drinks are already in the fresh
+        # accumulators.  Calling it again here is a safety net (e.g. midnight
+        # passed between log reading and this call) and is otherwise a no-op.
+        self._rollover_daily_counters()
+        if self._cap_baseline_pending:
+            # First compute of a new day: this poll's cap/manual counters become
+            # the baseline so yesterday's cumulative values are not counted as
+            # today's consumption.
             LOGGER.info(
-                "New day %s â€” resetting daily water tracking  cap_ml=%d  "
-                "log contributed today: %d drinks",
-                today, cap_ml, today_drinks,
+                "New day %s - re-baselining cap counters  cap_ml=%d  manual_ml=%d  "
+                "drinks today so far=%d (%dmL)",
+                today, cap_ml, manual_ml,
+                self._daily_accumulated_drinks, self._daily_accumulated_ml,
             )
-            self._daily_today_date          = today
-            self._daily_accumulated_ml      = 0
-            self._daily_accumulated_drinks  = today_drinks
-            self._daily_baseline_cap_ml     = cap_ml    # this poll's cap IS the baseline
+            self._cap_baseline_pending      = False
+            self._daily_baseline_cap_ml     = cap_ml
             self._daily_baseline_manual     = manual_ml
-            # Preserve last-drink info only if log produced a drink today
-            if not today_drinks:
-                self._daily_last_drink_ml   = 0
-                self._daily_last_drink_ts   = ""
-            # Preserve water_remaining â€” bottle still has water from yesterday
+            self._prev_cap_ml               = cap_ml   # baseline for delta
+            # Preserve water_remaining - bottle still has water from yesterday
             if self._daily_water_remaining <= 0:
                 self._daily_water_remaining = bottle_cap
-            self._prev_cap_ml               = cap_ml   # baseline for delta
-            # Fall through â€” compute totals correctly below instead of returning early
+            # Fall through - compute totals correctly below instead of returning early
 
         # â”€â”€ Delta-based accounting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # cap_ml may be daily-cumulative (NOT reset by CLEAR_LOGS) â€” at least
