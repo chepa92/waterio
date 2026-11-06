@@ -20,6 +20,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN, LOGGER,
@@ -305,6 +306,21 @@ class WaterioSensor(CoordinatorEntity[WaterioCoordinator], SensorEntity):
             return datetime.now(timezone.utc) - last_sync < timedelta(hours=24)
         except (ValueError, TypeError):
             return False
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Start of the current tracking day for "Water Intake Today".
+
+        The sensor uses state_class TOTAL, which without last_reset makes HA
+        statistics treat the midnight drop to 0 as NEGATIVE consumption
+        (yesterday's total subtracted from today's statistics).
+        """
+        if self.entity_description.key != "water_ml":
+            return None
+        day = getattr(self.coordinator, "daily_date", None)
+        if day is None:
+            return None
+        return dt_util.start_of_local_day(day)
 
     @property
     def native_value(self) -> Any:

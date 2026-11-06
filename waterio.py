@@ -276,10 +276,17 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Runtime-only BLE + poll state
         self._log_queue: asyncio.Queue | None = None
         self._water_level_from_log: bool = False
+        # True when the device log was read successfully this poll (log
+        # length known and every entry fetched), even if it held 0 entries.
+        # Only when this is False is the cap_ml-delta fallback allowed.
         self._had_any_log_entries: bool = False
+        # True when every log entry up to the device's log_count was fetched;
+        # CLEAR_LOGS is only sent in that case so unread drinks are never wiped.
+        self._log_read_complete: bool = False
         # Set when the day rolled over; cap/manual baselines are re-taken on
         # the next _compute_daily_water (needs this poll's cap_ml).
         self._cap_baseline_pending: bool = False
+        self._first_boot_pending: bool = False
         self._ble_lock: asyncio.Lock = asyncio.Lock()
 
         # Restore persisted daily hydration state + last-known sensor values
@@ -355,9 +362,15 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Initialize water_remaining to bottle capacity if not yet set
         # (first boot or migration from older version without remaining tracking).
-        if self._daily_water_remaining <= 0 and self._daily_today_date is not None:
+        if "_water_remaining" not in opts and self._daily_today_date is not None:
             _bv = int(self._settings.get(FIELD_BOTTLE_VOLUME, 0))
             self._daily_water_remaining = BOTTLE_VOLUME_ML.get(_bv, 500)
+
+        # HA restarted on a later day than the persisted one: start today's
+        # counters from zero right away instead of showing yesterday's totals
+        # until the first successful BLE sync.
+        if self._daily_today_date is not None:
+            self._rollover_daily_counters()
 
         # Reconstruct computed hydration fields from accumulators.
         # No BLE needed — everything is already in memory from opts above.
@@ -420,7 +433,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self._data.get("bottle_volume_type", 0), 500
                     )
                     if 0 <= level <= _bottle * 2:
-                        self._daily_water_remaining = level
+                        # Display only.  Do NOT update _daily_water_remaining:
+                        # it seeds prev_level for drink detection in
+                        # _process_log_entries, and the same 'l' entry is in
+                        # the log.  Updating the seed here made that drink
+                        # look like a 0 mL change, so it was never counted.
                         self._data[FIELD_WATER_REMAINING_ML] = level
                         LOGGER.info("Real-time measurement: type=%s  remaining=%dmL", ev, level)
                         self.async_set_updated_data(dict(self._data))
@@ -690,6 +707,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await asyncio.sleep(0.5)
 
         # 11. GET_LOG_LENGTH (0x0D) â€“ total log entries on device
+        self._data[FIELD_LOG_COUNT] = None   # unknown until the device answers
         if await self._write_cmd_v4(CMD_GET_LOG_LENGTH):
             await asyncio.sleep(0.5)
 
@@ -703,18 +721,42 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         #     GET_SYNC_INFO / GET_CAP_STATE each report cumulative values that
         #     behave differently).  _compute_daily_water uses a delta-based
         #     approach (cap_ml âˆ’ prev_cap_ml) that works either way.
-        if await self._write_cmd_v4(CMD_CLEAR_LOGS):
+        # Only clear when EVERY entry was read.  Previously CLEAR_LOGS was sent
+        # unconditionally, so a partial read (BLE drop, time budget, lost
+        # GET_LOG_LENGTH response) permanently deleted the unread drinks.
+        read_count = self._log_device_count
+        if not self._log_read_complete:
+            LOGGER.warning(
+                "CLEAR_LOGS skipped - log read incomplete (read up to %d of %s); "
+                "remaining entries will be read next sync",
+                read_count, self._data.get(FIELD_LOG_COUNT),
+            )
+        elif read_count == 0:
+            pass  # nothing on the device, nothing to clear
+        elif await self._write_cmd_v4(CMD_CLEAR_LOGS):
             await asyncio.sleep(0.5)
-            LOGGER.info("CLEAR_LOGS sent â€“ device log buffer cleared")
-        self._data[FIELD_LOG_COUNT] = 0
-        # Reset the incremental-read watermark: CLEAR_LOGS just reset the
-        # device log counter to 0, so the next sync must read from offset 0.
-        # Without this reset: start_offset = min(old_watermark, new_count)
-        # which always equals new_count, so the skip-guard
-        # (start_offset >= log_count) fires and returns [] forever —
-        # every drink logged after a sync is silently discarded.
-        self._log_device_count = 0
-        LOGGER.debug("CLEAR_LOGS: watermark reset to 0")
+            LOGGER.info("CLEAR_LOGS sent - verifying device log length")
+            # CLEAR_LOGS is written without response; confirm it took effect.
+            # If it did NOT and we reset the watermark to 0 anyway, the next
+            # sync re-reads (and double-counts) every drink just processed.
+            self._data[FIELD_LOG_COUNT] = None
+            if await self._write_cmd_v4(CMD_GET_LOG_LENGTH):
+                await asyncio.sleep(0.5)
+            after = self._data.get(FIELD_LOG_COUNT)
+            if after is not None and after >= read_count:
+                LOGGER.warning(
+                    "CLEAR_LOGS not applied (log length still %d) - keeping "
+                    "watermark %d to avoid re-reading entries", after, read_count,
+                )
+            else:
+                # Cleared (or no answer - assume cleared, as before).
+                self._log_device_count = 0
+                LOGGER.debug("CLEAR_LOGS: watermark reset to 0")
+        else:
+            LOGGER.warning(
+                "CLEAR_LOGS write failed - keeping watermark %d so the next "
+                "sync does not re-read (double-count) these entries", read_count,
+            )
 
         # Note: CMD_GET_SINGLE_MEAS (0x01) was tested but pv=12 firmware
         # ACKs without producing a measurement notification.
@@ -761,8 +803,15 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
              If data[3] < 16 or == 0, all entries have been read.
           4. Each 8-byte record: [ts_LE4, opCode, mMeasurement_LE2, extraData]
         """
-        log_count = self._data.get(FIELD_LOG_COUNT, 0) or 0
-        if not self._write_char or log_count == 0:
+        self._log_read_complete = False
+        log_count = self._data.get(FIELD_LOG_COUNT)
+        if log_count is None:
+            LOGGER.warning("READ_LOGS: device log length unknown (no response) - skipping")
+            return []
+        if not self._write_char:
+            return []
+        if log_count == 0:
+            self._log_read_complete = True   # known-empty log is a valid read
             return []
 
         _BATCH_SIZE = 50    # SDK default: request 50 entries at a time
@@ -791,6 +840,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         if start_offset >= log_count:
             LOGGER.debug("READ_LOGS: nothing new (device count=%d, last seen=%d)", log_count, start_offset)
+            self._log_read_complete = True
             return []
 
         # Hard wall-clock budget: stop reading before HA's setup watchdog fires.
@@ -863,10 +913,12 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 len(all_entries), start_offset, start_offset + len(all_entries),
                 log_count, dict(types),
             )
-            # Advance watermark: partial if budget was exhausted, full otherwise.
-            self._log_device_count = (
-                start_offset + len(all_entries) if budget_exhausted else log_count
-            )
+            # Advance watermark only as far as we actually read.  Previously a
+            # BLE drop / batch failure (not just the time budget) still set
+            # the watermark to log_count, silently skipping unread entries.
+            read_upto = start_offset + len(all_entries)
+            self._log_read_complete = (not budget_exhausted) and read_upto >= log_count
+            self._log_device_count = log_count if self._log_read_complete else read_upto
             return all_entries
         except asyncio.CancelledError:
             # HA cancelled the task (e.g. setup watchdog). Save partial progress
@@ -1009,7 +1061,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 past_drinks_total, past_ml_total,
             )
 
-        if last_level is not None and 0 < last_level <= bottle_cap * 4:
+        if last_level is not None and 0 <= last_level <= bottle_cap * 4:
             self._daily_water_remaining = last_level
             self._data[FIELD_WATER_REMAINING_ML] = last_level
             self._water_level_from_log = True
@@ -1020,7 +1072,10 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _read_logs_async(self) -> None:
         """Fetch log entries from device and process hydration events."""
         entries = await self._fetch_log_entries()
-        self._had_any_log_entries = len(entries) > 0
+        # A successful read of an empty/unchanged log is authoritative "no
+        # drinks", same as a housekeeping-only log.  Previously 0 entries
+        # always fell through to the cap_ml-delta fallback (phantom drinks).
+        self._had_any_log_entries = len(entries) > 0 or self._log_read_complete
         await self._process_log_entries(entries)
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -1039,6 +1094,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not await self._ensure_connected():
                 # Device not reachable â€” return last known data if we have any
                 self._data["ble_reachable"] = False
+                # Bottle out of range after midnight: still start the new day
+                # so "today" sensors don't keep showing yesterday's totals.
+                if self._rollover_daily_counters():
+                    self._publish_daily_fields(self._daily_accumulated_ml)
+                    self._persist_baseline()
                 if self._data.get(FIELD_LAST_SYNC):
                     LOGGER.info(
                         "BLE connect failed â€“ returning last known data  "
@@ -1083,6 +1143,24 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # being locked out of its own device.
                 await self.disconnect()
 
+    @property
+    def daily_date(self):
+        """Calendar date the 'today' counters currently belong to."""
+        return self._daily_today_date
+
+    def _publish_daily_fields(self, water_ml: int) -> None:
+        """Write the per-day hydration values into self._data."""
+        self._data[FIELD_WATER_ML]           = water_ml
+        self._data[FIELD_DRINK_COUNT_TODAY]  = self._daily_accumulated_drinks
+        self._data[FIELD_LAST_DRINK_ML]      = self._daily_last_drink_ml
+        self._data[FIELD_LAST_DRINK_TS]      = self._daily_last_drink_ts or None
+        self._data[FIELD_WATER_REMAINING_ML] = self._daily_water_remaining
+        # Override device-reported hydration_level with our own computation.
+        # The device byte[7] resets to 0 after CLEAR_LOGS / counter resets,
+        # but our water_ml tracks the real daily total.
+        goal = self._data.get(FIELD_DAILY_GOAL_ML) or 2000
+        self._data[FIELD_HYDRATION_LEVEL] = min(100, round(water_ml / goal * 100))
+
     def _rollover_daily_counters(self) -> bool:
         """Reset the per-day drink/mL accumulators when the calendar day changed.
 
@@ -1106,6 +1184,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             today, self._daily_today_date,
             self._daily_accumulated_drinks, self._daily_accumulated_ml,
         )
+        if self._daily_today_date is None:
+            self._first_boot_pending   = True
         self._daily_today_date         = today
         self._daily_accumulated_ml     = 0
         self._daily_accumulated_drinks = 0
@@ -1174,9 +1254,12 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._daily_baseline_cap_ml     = cap_ml
             self._daily_baseline_manual     = manual_ml
             self._prev_cap_ml               = cap_ml   # baseline for delta
-            # Preserve water_remaining - bottle still has water from yesterday
-            if self._daily_water_remaining <= 0:
-                self._daily_water_remaining = bottle_cap
+            # First boot ever: assume a full bottle.  Otherwise keep the
+            # physical level from yesterday (0 = genuinely empty bottle).
+            if self._first_boot_pending:
+                self._first_boot_pending = False
+                if self._daily_water_remaining <= 0:
+                    self._daily_water_remaining = bottle_cap
             # Fall through - compute totals correctly below instead of returning early
 
         # â”€â”€ Delta-based accounting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1302,18 +1385,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._daily_accumulated_ml, delta_cap, delta_manual, water_ml,
             )
 
-        # â”€â”€ Write all entities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        self._data[FIELD_WATER_ML]          = water_ml
-        self._data[FIELD_DRINK_COUNT_TODAY]  = self._daily_accumulated_drinks
-        self._data[FIELD_LAST_DRINK_ML]      = self._daily_last_drink_ml
-        self._data[FIELD_LAST_DRINK_TS]      = self._daily_last_drink_ts or None
-        self._data[FIELD_WATER_REMAINING_ML] = self._daily_water_remaining
-
-        # Override device-reported hydration_level with our own computation.
-        # The device byte[7] resets to 0 after CLEAR_LOGS / counter resets,
-        # but our water_ml tracks the real daily total.
-        goal = self._data.get(FIELD_DAILY_GOAL_ML) or 2000
-        self._data[FIELD_HYDRATION_LEVEL] = min(100, round(water_ml / goal * 100))
+        # -- Write all entities ------------------------------------------------
+        self._publish_daily_fields(water_ml)
 
         LOGGER.info(
             "Daily: water=%dmL  drinks=%d  last=%dmL@%s  remaining=%dmL",
