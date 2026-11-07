@@ -49,7 +49,7 @@ from .const import (
     FIELD_CAP_CLOSED, FIELD_IS_CHARGING,
     FIELD_IS_ACTIVE, FIELD_NEED_DRINK, FIELD_SILENT_MODE,
     FIELD_BATTERY_CELL, FIELD_MAC_ADDRESS, FIELD_DEVICE_CLOCK,
-    FIELD_LOG_COUNT, FIELD_TOTAL_CONSUMED_ML,
+    FIELD_LOG_COUNT, FIELD_TOTAL_CONSUMED_ML, FIELD_LAST_CHARGED,
     FIELD_LAST_DRINK_ML, FIELD_LAST_DRINK_TS, FIELD_DRINK_COUNT_TODAY,
     FIELD_WATER_REMAINING_ML,
     FIELD_HYDRATION_LEVEL, FIELD_REMINDER_COLOR,
@@ -282,6 +282,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._log_read_complete: bool = False
         # Notifications received during the current sync (0 = bottle silent).
         self._notif_count: int = 0
+        # Fresh readings from THIS sync only (None = not received), so a stale
+        # value left in self._data from an earlier sync is never mistaken for
+        # a new charge.
+        self._sync_battery: int | None = None
+        self._sync_charging: bool | None = None
         # Set when the day rolled over; cap/manual baselines are re-taken on
         # the next _compute_daily_water (needs this poll's cap_ml).
         self._cap_baseline_pending: bool = False
@@ -358,6 +363,13 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # and never reset by the persistence-version migration above.
         self._total_consumed_ml = int(opts.get("_total_consumed_ml", 0))
         self._data[FIELD_TOTAL_CONSUMED_ML] = self._total_consumed_ml
+
+        # Last time the cap was seen charging + battery % at the previous
+        # sync (for jump detection).  Both survive HA restarts.
+        self._last_charged: str | None = opts.get("_last_charged") or None
+        _pb = opts.get("_prev_battery")
+        self._prev_battery: int | None = int(_pb) if _pb is not None else None
+        self._data[FIELD_LAST_CHARGED] = self._last_charged
 
         saved_date_str: str | None = opts.get("_baseline_date")
         try:
@@ -449,6 +461,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
             return
         parsed = parse_notification(raw)
+        if parsed and FIELD_IS_CHARGING in parsed:
+            self._sync_charging = bool(parsed[FIELD_IS_CHARGING])
         if parsed:
             # Don't let intermediate notifications overwrite computed fields
             # that _compute_daily_water manages (prevents 0% hydration_level
@@ -635,6 +649,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             try:
                 raw = await self._client.read_gatt_char(uuid)
                 self._data[field] = parser(bytearray(raw))
+                if field == FIELD_BATTERY:
+                    self._sync_battery = int(self._data[field])
             except (BleakError, KeyError):
                 pass  # not all firmware versions expose every characteristic
             except Exception:
@@ -1130,6 +1146,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # ble_reachable=True.  Without this, writable entities flicker
                 # "unavailable" on every intermediate notification during the sync.
                 self._data["ble_reachable"] = True
+                self._sync_battery = None
+                self._sync_charging = None
                 await self._read_standard_gatt()      # battery, firmware, manufacturer â€¦
                 # Roll the daily counters over to the new day BEFORE reading
                 # logs, so drinks from today's log entries land in fresh
@@ -1165,6 +1183,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # it was set after, so the persisted snap was always one sync
                 # behind and the sensor showed the old time after an HA restart.
                 self._data[FIELD_LAST_SYNC] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                self._update_last_charged()
                 self._compute_daily_water()           # daily totals from log-based accumulators
 
                 # Strip private accumulator fields (prefixed with '_') from the
@@ -1191,6 +1210,30 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             public["ble_reachable"] = False
             return public
         raise UpdateFailed(f"Cannot connect to Water.io cap {self._mac}")
+
+    # Battery % rise between two syncs that counts as "was charged".
+    _CHARGE_JUMP_PCT = 10
+
+    def _update_last_charged(self) -> None:
+        """Record when the cap was last charged (persisted by _persist_baseline).
+
+        The device log has no charging event, so this uses this sync's
+        readings: the cap reports it is charging right now, or the battery
+        rose by >= _CHARGE_JUMP_PCT since the previous sync (charged between
+        syncs).  Accuracy is one sync interval.
+        """
+        reason = None
+        if self._sync_charging:
+            reason = "cap reports charging"
+        elif (self._sync_battery is not None and self._prev_battery is not None
+                and self._sync_battery - self._prev_battery >= self._CHARGE_JUMP_PCT):
+            reason = f"battery rose {self._prev_battery}% -> {self._sync_battery}%"
+        if reason:
+            self._last_charged = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._data[FIELD_LAST_CHARGED] = self._last_charged
+            LOGGER.info("Charge detected (%s) - last_charged=%s", reason, self._last_charged)
+        if self._sync_battery is not None:
+            self._prev_battery = self._sync_battery
 
     def _remaining_for_display(self) -> int | None:
         """Water remaining, or None (sensor shows Unknown) if never measured."""
@@ -1536,6 +1579,9 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             new_options["_baseline_date"]       = self._daily_today_date.isoformat() if self._daily_today_date else ""
             new_options["_log_device_count"]     = self._log_device_count
             new_options["_total_consumed_ml"]    = self._total_consumed_ml
+            new_options["_last_charged"]         = self._last_charged or ""
+            if self._prev_battery is not None:
+                new_options["_prev_battery"]     = self._prev_battery
             if self._journal_count is not None:
                 new_options["_journal_entries"]  = self._journal_count
             # Snapshot BLE-read-only fields so they survive HA restarts

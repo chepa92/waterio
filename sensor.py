@@ -31,6 +31,7 @@ from .const import (
     FIELD_BATTERY_CELL, FIELD_DEVICE_CLOCK, FIELD_LOG_COUNT, FIELD_MAC_ADDRESS,
     FIELD_LAST_DRINK_ML, FIELD_LAST_DRINK_TS, FIELD_DRINK_COUNT_TODAY,
     FIELD_WATER_REMAINING_ML, FIELD_JOURNAL_ENTRIES, FIELD_TOTAL_CONSUMED_ML,
+    FIELD_LAST_CHARGED,
 )
 from .waterio import WaterioCoordinator
 
@@ -169,6 +170,16 @@ SENSOR_DESCRIPTIONS: tuple[WaterioSensorDescription, ...] = (
         # This is the charge-circuit percentage (matches the app's value).
     ),
 
+    WaterioSensorDescription(
+        key="last_charged",
+        field=FIELD_LAST_CHARGED,
+        name="Last Charged",
+        # Timestamp: HA shows it as "3 days ago".  Persisted across restarts.
+        # Detected from the cap's charging flag or a battery jump between
+        # syncs, so accuracy is one sync interval.
+        device_class=SensorDeviceClass.TIMESTAMP,
+        icon="mdi:battery-charging-high",
+    ),
     WaterioSensorDescription(
         key="last_sync",
         field=FIELD_LAST_SYNC,
@@ -333,7 +344,7 @@ class WaterioSensor(CoordinatorEntity[WaterioCoordinator], SensorEntity):
             return None
         value = self.coordinator.data.get(self.entity_description.field)
         # Convert ISO timestamp string fields to timezone-aware datetime
-        if self.entity_description.key in ("last_sync", "device_clock", "last_drink_ts") and isinstance(value, str):
+        if self.entity_description.key in ("last_sync", "device_clock", "last_drink_ts", "last_charged") and isinstance(value, str):
             try:
                 dt = datetime.fromisoformat(value)
                 if dt.tzinfo is None:
