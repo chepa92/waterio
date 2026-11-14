@@ -890,6 +890,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         all_entries: list[dict] = []
         budget_exhausted = False
         batch_size = _BATCH_SIZE
+        restarted = False
+        stalled = False
         try:
             offset = start_offset
             while offset < log_count and len(all_entries) < _MAX_ENTRIES:
@@ -962,11 +964,31 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                         batch_size = 1
                         continue
-                    # Even a single-entry request got no entries: give up
-                    # instead of re-sending until the budget runs out, and
-                    # log what the device returns elsewhere so the offset
-                    # semantics can be worked out from real data.
+                    if start_offset > 0 and not all_entries and not restarted:
+                        # The saved watermark leads nowhere (e.g. it was
+                        # advanced by a read that was cancelled before its
+                        # entries were processed).  Start over from 0.
+                        LOGGER.warning(
+                            "READ_LOGS: device returns nothing at saved offset "
+                            "%d - restarting from 0", start_offset)
+                        restarted = True
+                        start_offset = 0
+                        offset = 0
+                        self._log_device_count = 0
+                        batch_size = _BATCH_SIZE
+                        continue
+                    # Even a single-entry request got no entries: the rest of
+                    # the log is unreachable.  Stop (instead of re-sending
+                    # until the budget runs out), log what the device returns
+                    # elsewhere, and treat the read as complete so CLEAR_LOGS
+                    # can restore normal operation.  Everything reachable has
+                    # been read and is processed by the caller.
                     await self._probe_log_offsets(log_count, offset)
+                    stalled = True
+                    LOGGER.warning(
+                        "READ_LOGS: device stops answering at %d/%d - treating "
+                        "the remaining %d entries as unreachable",
+                        offset, log_count, log_count - offset)
                     break
 
             from collections import Counter
@@ -980,7 +1002,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # BLE drop / batch failure (not just the time budget) still set
             # the watermark to log_count, silently skipping unread entries.
             read_upto = start_offset + len(all_entries)
-            self._log_read_complete = (not budget_exhausted) and read_upto >= log_count
+            self._log_read_complete = (not budget_exhausted) and (read_upto >= log_count or stalled)
             self._log_device_count = log_count if self._log_read_complete else read_upto
             return all_entries
         except asyncio.CancelledError:
