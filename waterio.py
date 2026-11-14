@@ -962,8 +962,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                         batch_size = 1
                         continue
-                    # Even a single-entry request got no answer: give up
-                    # instead of re-sending until the budget runs out.
+                    # Even a single-entry request got no entries: give up
+                    # instead of re-sending until the budget runs out, and
+                    # log what the device returns elsewhere so the offset
+                    # semantics can be worked out from real data.
+                    await self._probe_log_offsets(log_count, offset)
                     break
 
             from collections import Counter
@@ -995,6 +998,34 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
         finally:
             self._log_queue = None
+
+    async def _probe_log_offsets(self, log_count: int, stuck_at: int) -> None:
+        """Diagnostic: request single entries at a few offsets and log them."""
+        probes = sorted({0, 1, 49, 50, 51, 52, 100, 300, log_count // 2,
+                         log_count - 2, log_count - 1})
+        LOGGER.warning("READ_LOGS probe: stuck at %d/%d, probing offsets %s",
+                       stuck_at, log_count, probes)
+        for off in probes:
+            if off < 0 or off >= log_count:
+                continue
+            if not self._client or not self._client.is_connected:
+                return
+            while not self._log_queue.empty():
+                self._log_queue.get_nowait()
+            try:
+                await self._client.write_gatt_char(
+                    self._write_char, build_read_logs_cmd(off, count=1), response=False)
+                data = await asyncio.wait_for(self._log_queue.get(), timeout=3.0)
+            except asyncio.TimeoutError:
+                LOGGER.warning("READ_LOGS probe @%d: no notification (3s)", off)
+                continue
+            except (BleakError, AttributeError) as exc:
+                LOGGER.warning("READ_LOGS probe @%d: write failed %s", off, exc)
+                return
+            n = data[3] if len(data) >= 4 else 0
+            ent = parse_log_entry(bytes(data[4:12])) if n and len(data) >= 12 else None
+            LOGGER.warning("READ_LOGS probe @%d: n=%d raw=%s entry=%s",
+                           off, n, bytes(data).hex(), ent)
 
     async def _process_log_entries(self, all_entries: list[dict]) -> None:
         """Save raw log entries to the journal and process drink/refill events.
