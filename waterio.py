@@ -1214,6 +1214,18 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # being locked out of its own device.
                 await self.disconnect()
 
+    def initial_data(self) -> dict[str, Any]:
+        """Persisted state to publish at setup, without touching BLE.
+
+        Setup must not block on a BLE connect + log read: that exceeded any
+        sane timeout (backlog reads take minutes) and the cancelled attempt
+        threw away the entries already read, so the sync never progressed.
+        """
+        self._data["ble_reachable"] = False
+        public = {k: v for k, v in self._data.items() if not k.startswith("_")}
+        public["ble_reachable"] = False
+        return public
+
     def _unreachable_result(self) -> dict[str, Any]:
         """Return last known data (sensors stay available until stale)."""
         self._data["ble_reachable"] = False
