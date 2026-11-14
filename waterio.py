@@ -422,6 +422,11 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # on the device at the end of the last successful sync.  Next sync
         # starts reading from this offset so we never re-read old entries.
         self._log_device_count: int = int(opts.get("_log_device_count", 0))
+        # Newest log entry already processed (ts + raws at that ts).  Lets a
+        # re-read of the same device log (e.g. CLEAR_LOGS not applied, restart
+        # from offset 0) skip entries instead of double counting them.
+        self._log_last_ts: int = int(opts.get("_log_last_ts", 0))
+        self._log_last_raws: list[str] = list(opts.get("_log_last_raws", []))
 
     # BLE notification handler
     # ------------------------------------------------------------------
@@ -766,25 +771,9 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         elif read_count == 0:
             pass  # nothing on the device, nothing to clear
-        elif await self._write_cmd_v4(CMD_CLEAR_LOGS):
-            await asyncio.sleep(0.5)
-            LOGGER.info("CLEAR_LOGS sent - verifying device log length")
-            # CLEAR_LOGS is written without response; confirm it took effect.
-            # If it did NOT and we reset the watermark to 0 anyway, the next
-            # sync re-reads (and double-counts) every drink just processed.
-            self._data[FIELD_LOG_COUNT] = None
-            if await self._write_cmd_v4(CMD_GET_LOG_LENGTH):
-                await asyncio.sleep(0.5)
-            after = self._data.get(FIELD_LOG_COUNT)
-            if after is not None and after >= read_count:
-                LOGGER.warning(
-                    "CLEAR_LOGS not applied (log length still %d) - keeping "
-                    "watermark %d to avoid re-reading entries", after, read_count,
-                )
-            else:
-                # Cleared (or no answer - assume cleared, as before).
-                self._log_device_count = 0
-                LOGGER.debug("CLEAR_LOGS: watermark reset to 0")
+        elif await self._clear_logs_verified():
+            self._log_device_count = 0
+            LOGGER.info("CLEAR_LOGS applied - watermark reset to 0")
         else:
             LOGGER.warning(
                 "CLEAR_LOGS write failed - keeping watermark %d so the next "
@@ -1003,7 +992,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # the watermark to log_count, silently skipping unread entries.
             read_upto = start_offset + len(all_entries)
             self._log_read_complete = (not budget_exhausted) and (read_upto >= log_count or stalled)
-            self._log_device_count = log_count if self._log_read_complete else read_upto
+            self._log_device_count = (log_count if (self._log_read_complete and not stalled)
+                                      else read_upto)
             return all_entries
         except asyncio.CancelledError:
             # HA cancelled the task (e.g. setup watchdog). Save partial progress
@@ -1049,6 +1039,51 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             LOGGER.warning("READ_LOGS probe @%d: n=%d raw=%s entry=%s",
                            off, n, bytes(data).hex(), ent)
 
+    async def _log_head_raw(self) -> str | None:
+        """Raw hex of log entry 0: '' if the log is empty, None if no answer."""
+        self._log_queue = asyncio.Queue()
+        try:
+            await self._client.write_gatt_char(
+                self._write_char, build_read_logs_cmd(0, count=1), response=False)
+            data = await asyncio.wait_for(self._log_queue.get(), timeout=3.0)
+        except (asyncio.TimeoutError, BleakError, AttributeError):
+            return None
+        finally:
+            self._log_queue = None
+        n = data[3] if len(data) >= 4 else 0
+        return bytes(data[4:12]).hex() if n and len(data) >= 12 else ""
+
+    async def _clear_logs_verified(self) -> bool:
+        """Send CLEAR_LOGS and verify it worked by looking at entry 0.
+
+        GET_LOG_LENGTH is not a reliable check: it kept growing (719) while
+        only 51 entries were readable.  Entry 0 changing/vanishing is.  If the
+        compact 4-byte command is not applied, retry padded to 8 bytes.
+        """
+        before = await self._log_head_raw()
+        for size in (4, 8):
+            pkt = make_cmd(CMD_CLEAR_LOGS, b"", size=size)
+            try:
+                await self._client.write_gatt_char(self._write_char, pkt, response=False)
+            except (BleakError, AttributeError) as exc:
+                LOGGER.warning("CLEAR_LOGS write failed (%d-byte): %s", size, exc)
+                return False
+            await asyncio.sleep(1.0)
+            after = await self._log_head_raw()
+            LOGGER.info("CLEAR_LOGS %d-byte sent: entry0 before=%s after=%s",
+                        size, before, after)
+            if before is None or after is None:
+                # Cannot verify: fall back to the log length check.
+                self._data[FIELD_LOG_COUNT] = None
+                if await self._write_cmd_v4(CMD_GET_LOG_LENGTH):
+                    await asyncio.sleep(0.5)
+                n = self._data.get(FIELD_LOG_COUNT)
+                return n is not None and n < (self._log_device_count or 1)
+            if after != before:
+                return True
+        LOGGER.warning("CLEAR_LOGS not applied by the device (entry 0 unchanged)")
+        return False
+
     async def _process_log_entries(self, all_entries: list[dict]) -> None:
         """Save raw log entries to the journal and process drink/refill events.
 
@@ -1063,6 +1098,22 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         entries spanning multiple calendar days are processed in order.  Only
         entries from TODAY accumulate into the daily drink counters.
         """
+        # Drop entries we have already processed (re-read of an uncleared log).
+        _seen = lambda e: (e["ts"] < self._log_last_ts or
+                           (e["ts"] == self._log_last_ts
+                            and e["raw"] in self._log_last_raws))
+        _fresh = [e for e in all_entries if not _seen(e)]
+        if len(_fresh) != len(all_entries):
+            LOGGER.info("READ_LOGS: skipping %d already-processed entries",
+                        len(all_entries) - len(_fresh))
+        all_entries = _fresh
+        if all_entries:
+            _mx = max(e["ts"] for e in all_entries)
+            _raws = [e["raw"] for e in all_entries if e["ts"] == _mx]
+            if _mx == self._log_last_ts:
+                _raws = list(dict.fromkeys(self._log_last_raws + _raws))
+            self._log_last_ts, self._log_last_raws = _mx, _raws
+
         # Save ALL raw entries to the journal BEFORE processing — data is safe
         # even if the processing logic below crashes.
         await self._save_journal(all_entries)
@@ -1685,6 +1736,8 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             new_options["_prev_cap_ml"]         = self._prev_cap_ml
             new_options["_baseline_date"]       = self._daily_today_date.isoformat() if self._daily_today_date else ""
             new_options["_log_device_count"]     = self._log_device_count
+            new_options["_log_last_ts"]          = self._log_last_ts
+            new_options["_log_last_raws"]         = self._log_last_raws
             new_options["_total_consumed_ml"]    = self._total_consumed_ml
             new_options["_last_charged"]         = self._last_charged or ""
             if self._prev_battery is not None:
