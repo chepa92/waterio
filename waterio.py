@@ -961,10 +961,14 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except asyncio.CancelledError:
             # HA cancelled the task (e.g. setup watchdog). Save partial progress
             # so the next sync resumes from here rather than starting from 0.
-            self._log_device_count = start_offset + len(all_entries)
+            # A cancelled read never returns its entries, so they are never
+            # processed/journaled.  Advancing the watermark would skip them
+            # forever; keep it where it was so they are re-read next sync.
             LOGGER.warning(
-                "READ_LOGS: task cancelled at offset %d/%d — partial watermark saved",
-                self._log_device_count, log_count,
+                "READ_LOGS: task cancelled at offset %d/%d — %d unprocessed "
+                "entries dropped, watermark stays at %d",
+                start_offset + len(all_entries), log_count,
+                len(all_entries), start_offset,
             )
             raise
         finally:
