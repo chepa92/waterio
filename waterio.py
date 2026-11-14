@@ -889,6 +889,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._log_queue = asyncio.Queue()
         all_entries: list[dict] = []
         budget_exhausted = False
+        batch_size = _BATCH_SIZE
         try:
             offset = start_offset
             while offset < log_count and len(all_entries) < _MAX_ENTRIES:
@@ -908,7 +909,7 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "READ_LOGS: BLE disconnected at offset %d – aborting log read", offset
                     )
                     break
-                end = min(offset + _BATCH_SIZE, log_count)
+                end = min(offset + batch_size, log_count)
                 pkt = build_read_logs_cmd(offset, count=end - offset)
                 try:
                     await self._client.write_gatt_char(self._write_char, pkt, response=False)
@@ -950,8 +951,19 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "" if offset > _prev_offset else "  ** NO PROGRESS **",
                 )
                 if offset <= _prev_offset:
-                    # Device did not answer this batch.  Re-sending the same
-                    # request until the budget runs out just burns time.
+                    if batch_size > 1:
+                        # The device answered the first batch, then ignored
+                        # every later one (0 entries for 150s at offset 51).
+                        # Live captures showed one notification per command,
+                        # so fall back to one entry per command.
+                        LOGGER.warning(
+                            "READ_LOGS: no answer to batch @%d - falling back "
+                            "to one entry per command", _prev_offset,
+                        )
+                        batch_size = 1
+                        continue
+                    # Even a single-entry request got no answer: give up
+                    # instead of re-sending until the budget runs out.
                     break
 
             from collections import Counter
