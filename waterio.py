@@ -942,7 +942,17 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if entry_count < 16:
                         batch_done = True
 
+                _prev_offset = offset
                 offset = start_offset + len(all_entries)
+                LOGGER.info(
+                    "READ_LOGS: batch @%d → %d entries so far (offset %d/%d)%s",
+                    _prev_offset, len(all_entries), offset, log_count,
+                    "" if offset > _prev_offset else "  ** NO PROGRESS **",
+                )
+                if offset <= _prev_offset:
+                    # Device did not answer this batch.  Re-sending the same
+                    # request until the budget runs out just burns time.
+                    break
 
             from collections import Counter
             types = Counter(e["type"] for e in all_entries)
