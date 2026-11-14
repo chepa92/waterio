@@ -17,6 +17,7 @@ from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -877,7 +878,12 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Hard wall-clock budget: stop reading before HA's setup watchdog fires.
         # Partial progress is saved so the next sync continues from where we left off.
-        _BUDGET_S = 20.0
+        # Only the very first refresh (self.data is None) runs under HA's
+        # setup watchdog; scheduled polls can afford a much longer read.  A
+        # 20s budget moved only ~50 entries per sync, so a backlog of several
+        # hundred entries (bottle unreachable for days) took half a day to
+        # drain and "today" stayed empty.
+        _BUDGET_S = 20.0 if self.data is None else 150.0
         _deadline = asyncio.get_event_loop().time() + _BUDGET_S
 
         self._log_queue = asyncio.Queue()
@@ -1155,7 +1161,17 @@ class WaterioCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # top of yesterday's totals and then wiped by the reset.
                 self._rollover_daily_counters()
                 self._notif_count = 0
+                _wm_before = self._log_device_count
                 await self._fetch_protocol_data()     # proprietary hydration + cap-state
+                if (not self._log_read_complete
+                        and self._log_device_count > _wm_before):
+                    # Partial log read that made progress: continue soon
+                    # instead of waiting a full poll interval.
+                    async_call_later(
+                        self.hass, 15,
+                        lambda _now: self.hass.async_create_task(
+                            self.async_request_refresh()),
+                    )
                 if self._notif_count == 0:
                     LOGGER.warning(
                         "No responses from %s during sync - treating as unreachable",
